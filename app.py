@@ -90,12 +90,65 @@ sku = E.build_sku_table(sales, inv, asof)
 rec = E.recommend(sku, A, pos, costs, asof)
 cw = E.colorway_rollup(rec, A["otb"])
 asof_d = pd.to_datetime(asof).date()
+has_inv = E.has_inventory(inv)
+vs = E.value_summary(sku, costs, A["default_cost"])
+health = E.data_health(sales, inv, asof, costs, sku)
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("As-of (sales)", str(asof_d))
+def _short(d):
+    if d is None: return "—"
+    t = pd.to_datetime(d); return f"{t.month}/{t.day}/{t.strftime('%y')}"
+
+if not has_inv:
+    st.warning(
+        "⚠️ **No inventory loaded.** The order needs your current on-hand to be accurate — "
+        "without it every SKU reads as empty, so the quantities below are rough guesses. "
+        "Upload a *Month-end inventory snapshot* (or load from the folder) and they'll snap into place.")
+
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Sales window", f"{_short(health['sales_min'])} → {_short(health['sales_max'])}",
+          help="Earliest sales date in the data → most recent (as-of).")
 c2.metric("Active SKUs", f"{len(sku):,}")
-c3.metric("Colorways to buy", int((cw["InBudget"] == "BUY").sum()))
-c4.metric("This week's spend", f"${cw.loc[cw['InBudget']=='BUY','OrderCost'].sum():,.0f} / ${A['otb']:,.0f}")
+c3.metric("Inventory value", f"${vs['total']:,.0f}" if has_inv else "—",
+          help="On-hand units × unit cost across all SKUs.")
+c4.metric("Dead stock", f"${vs['dead']:,.0f}" if has_inv else "—",
+          help=(f"{vs['dead_skus']} SKUs · {vs['dead_units']:,} units on-hand with no sales in 90 days"
+                if has_inv else "Load inventory to compute."))
+c5.metric("This week's spend",
+          f"${cw.loc[cw['InBudget']=='BUY','OrderCost'].sum():,.0f} / ${A['otb']:,.0f}",
+          help=f"{int((cw['InBudget']=='BUY').sum())} colorways funded by Open-to-Buy.")
+
+with st.expander("🩺 Data health — is my data clean?"):
+    hc1, hc2 = st.columns(2)
+    with hc1:
+        st.markdown("**Sales**")
+        st.write(f"Window: {_short(health['sales_min'])} → {_short(health['sales_max'])}")
+        sm = health["sales_missing"]
+        if sm:
+            st.info(f"{len(sm)} day(s) with no sales in the last 90 (may be true zero-sales days): "
+                    + ", ".join(_short(d) for d in sm[:12]) + (" …" if len(sm) > 12 else ""))
+        else:
+            st.success("No gaps in the last 90 days of sales.")
+    with hc2:
+        st.markdown("**Inventory**")
+        if health["inv_loaded"]:
+            st.write(f"Snapshots: {_short(health['inv_min'])} → {_short(health['inv_max'])} "
+                     f"({len(health['inv_dates'])} day(s), ~{health['inv_cadence_days']:.0f}-day cadence)")
+            if health["inv_daily"] and health["inv_missing"]:
+                im = health["inv_missing"]
+                st.warning(f"⚠️ Missing {len(im)} snapshot day(s) — this hurts the in-stock-days math: "
+                           + ", ".join(_short(d) for d in im[:12]) + (" …" if len(im) > 12 else ""))
+            elif health["inv_big_gaps"]:
+                bg = health["inv_big_gaps"]
+                st.info("Snapshots are sparse; larger-than-usual gaps: "
+                        + ", ".join(f"{_short(a)}→{_short(b)}" for a, b in bg[:6]))
+            else:
+                st.success("No unusual gaps in your inventory snapshots.")
+        else:
+            st.warning("No inventory loaded — upload a Month-end inventory snapshot.")
+    mc = health["missing_costs"]
+    if mc:
+        st.caption(f"💲 {len(mc)} product(s) using the ${A['default_cost']:.0f} default cost — "
+                   "set real costs in the **Unit costs** tab for accurate value & profit ranking.")
 
 tabs = st.tabs(["🛒 Order", "🔬 By size", "🔎 Audit a SKU", "🚚 Open POs",
                 "✅ Receipts to confirm", "🆕 New products", "💲 Unit costs"])
@@ -103,6 +156,8 @@ tabs = st.tabs(["🛒 Order", "🔬 By size", "🔎 Audit a SKU", "🚚 Open POs
 # ---------------- Order (colorway) ----------------
 with tabs[0]:
     st.subheader("Recommended order — by colorway (funded by Open-to-Buy)")
+    if not has_inv:
+        st.warning("Quantities assume **0 on-hand** until you load inventory — treat this as a preview.")
     show = cw[["Product","Color","Pace","OnHand","OnOrder","ReorderPt","Order",
                "XS","S","M","L","XL","Oth","ProfitVelocity","OrderCost","CumCost","InBudget"]].copy()
     show = show.round({"Pace":2,"ProfitVelocity":1,"OrderCost":0,"CumCost":0})
@@ -118,6 +173,8 @@ with tabs[0]:
 # ---------------- By size ----------------
 with tabs[1]:
     st.subheader("Size-level engine — each SKU its own reorder point")
+    if not has_inv:
+        st.warning("Quantities assume **0 on-hand** until you load inventory — treat this as a preview.")
     prod = st.selectbox("Filter to a product (optional)", ["(all)"] + sorted(rec["Product"].unique()))
     d = rec if prod == "(all)" else rec[rec["Product"] == prod]
     st.dataframe(d[["Product","Color","Size","Pace","DIS30","OnHand","OnOrder","ReorderPt",

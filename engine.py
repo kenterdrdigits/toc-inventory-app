@@ -109,6 +109,11 @@ def load_from_uploads(files):
 
 # ---------------------------------------------------------------- core build
 def build_sku_table(sales: pd.DataFrame, inv: pd.DataFrame, asof: pd.Timestamp) -> pd.DataFrame:
+    # De-dupe inventory: if the same snapshot date is loaded twice (e.g. the same
+    # file uploaded twice, or a corrected re-export), keep the last copy so on-hand
+    # is never doubled. Sales is already de-duped in load_sales_from_frames.
+    if inv is not None and not inv.empty:
+        inv = inv.drop_duplicates(subset=['date', 'key'], keep='last')
     def win(d): cut = asof - pd.Timedelta(days=d - 1); return sales[sales['Day'] >= cut]
     U = {d: win(d).groupby('key')['units'].sum() for d in (30, 60, 90)}
     NS90 = win(90).groupby('key')['ns'].sum()
@@ -152,7 +157,10 @@ def recommend(sku: pd.DataFrame, A: dict, open_pos: pd.DataFrame, costs: dict, a
     df = sku.copy()
     df['Lead'] = np.where(df['Category'] == 'swim', A['lead_swim'], A['lead_apparel'])
     def pace(r):
-        if r.U30 > 0: return r.U30 / max(r.DIS30, 1)
+        # Divide units by days the SKU was actually IN STOCK. If we have no
+        # in-stock days (DIS30 == 0 — usually because no inventory was loaded),
+        # fall back to calendar days so we never divide a whole month by 1 day.
+        if r.U30 > 0: return r.U30 / (r.DIS30 if r.DIS30 > 0 else 30)
         if r.U60 > 0: return r.U60 / 60
         if r.U90 > 0: return r.U90 / 90
         return 0.0
@@ -228,3 +236,67 @@ def detect_receipts(inv: pd.DataFrame, open_pos: pd.DataFrame, tol_frac=0.25) ->
 
 def detect_new_products(sku: pd.DataFrame, costs: dict) -> list[str]:
     return sorted(set(sku['Product']) - set(costs.keys()))
+
+# ---------------------------------------------------------------- data health & value
+def has_inventory(inv: pd.DataFrame) -> bool:
+    return inv is not None and not inv.empty
+
+def value_summary(sku: pd.DataFrame, costs: dict, default_cost: float) -> dict:
+    """Total inventory value and dead-stock value (on-hand with no 90-day sales)."""
+    if sku is None or sku.empty or 'OnHand' not in sku.columns:
+        return dict(total=0.0, dead=0.0, dead_units=0, dead_skus=0, has_oh=False)
+    df = sku.copy()
+    df['oh'] = df['OnHand'].clip(lower=0)
+    df['c'] = df['Product'].map(lambda p: costs.get(p) if costs.get(p) else default_cost)
+    total = float((df['oh'] * df['c']).sum())
+    dead = df[(df['oh'] > 0) & (df['U90'] <= 0)]
+    return dict(total=total,
+                dead=float((dead['oh'] * dead['c']).sum()),
+                dead_units=int(dead['oh'].sum()),
+                dead_skus=int(len(dead)),
+                has_oh=bool(df['oh'].sum() > 0))
+
+def data_health(sales: pd.DataFrame, inv: pd.DataFrame, asof,
+                costs: dict | None = None, sku: pd.DataFrame | None = None) -> dict:
+    """Date ranges, missing-day gaps (sales + inventory), and missing-cost count."""
+    asof = pd.to_datetime(asof).normalize()
+    out = {}
+    sdays = pd.to_datetime(sales['Day']).dt.normalize()
+    out['sales_min'], out['sales_max'] = sdays.min(), sdays.max()
+    present_sales = set(sdays.unique())
+    recent = pd.date_range(asof - pd.Timedelta(days=89), asof)
+    out['sales_missing'] = [d for d in recent if d not in present_sales]
+
+    if has_inventory(inv):
+        idates = sorted(pd.to_datetime(pd.Series(inv['date'].unique())).dt.normalize().unique())
+        out['inv_loaded'] = True
+        out['inv_min'], out['inv_max'] = idates[0], idates[-1]
+        out['inv_dates'] = idates
+        gaps = [(idates[i] - idates[i - 1]).days for i in range(1, len(idates))]
+        med = float(np.median(gaps)) if gaps else 1.0
+        out['inv_cadence_days'] = med
+        # Only flag "missing days" when snapshots are roughly DAILY. If they're
+        # sparse (e.g. month-end), every non-snapshot day isn't a gap — it's the
+        # cadence — so we report unusually large gaps instead of crying wolf.
+        if gaps and med <= 2:
+            present_inv = set(idates)
+            out['inv_daily'] = True
+            out['inv_missing'] = [d for d in pd.date_range(idates[0], idates[-1])
+                                  if d not in present_inv]
+            out['inv_big_gaps'] = []
+        else:
+            out['inv_daily'] = False
+            out['inv_missing'] = []
+            out['inv_big_gaps'] = [(idates[i - 1], idates[i]) for i in range(1, len(idates))
+                                   if gaps and gaps[i - 1] > max(2 * med, med + 2)]
+    else:
+        out['inv_loaded'] = False
+        out['inv_min'] = out['inv_max'] = None
+        out['inv_missing'], out['inv_dates'], out['inv_big_gaps'] = [], [], []
+        out['inv_daily'], out['inv_cadence_days'] = False, None
+
+    if sku is not None and costs is not None and not sku.empty:
+        out['missing_costs'] = sorted(set(sku['Product'].unique()) - set(costs.keys()))
+    else:
+        out['missing_costs'] = []
+    return out
