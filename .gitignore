@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+venv/
+# user state + raw exports (don't commit data / secrets)
+data/*.csv
+data/*.json
+exports/
+*.xlsx
+# NEVER commit your password / secrets
+.streamlit/secrets.toml
