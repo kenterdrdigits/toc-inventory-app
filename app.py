@@ -11,6 +11,33 @@ import engine as E
 import storage as S
 
 st.set_page_config(page_title="TOC Inventory", layout="wide", page_icon="📦")
+
+# ---------------- simple password gate ----------------
+def check_password() -> bool:
+    try:
+        correct = st.secrets.get("APP_PASSWORD", None)
+    except Exception:
+        correct = None
+    if not correct:
+        st.error("No app password is set yet. Add APP_PASSWORD in Secrets "
+                 "(Streamlit Cloud → Manage app → Settings → Secrets, "
+                 "or locally in a file at .streamlit/secrets.toml).")
+        return False
+    if st.session_state.get("auth_ok"):
+        return True
+    st.markdown("### 🔒 TOC Inventory — sign in")
+    pw = st.text_input("Password", type="password")
+    if pw:
+        if pw == correct:
+            st.session_state["auth_ok"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    return False
+
+if not check_password():
+    st.stop()
+
 st.title("📦 TOC Inventory — order what actually sells")
 
 # ---------------- sidebar: data + rules ----------------
