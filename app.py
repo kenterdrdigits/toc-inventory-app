@@ -74,7 +74,10 @@ with st.sidebar:
                                help="Fund colorways by profit-velocity until this is spent.")
     A["default_cost"] = st.number_input("Default unit cost ($)", 0.0, 1000.0, float(A["default_cost"]))
     A["pack"] = st.number_input("Pack / MOQ", 1, 1000, int(A["pack"]))
-    S.save_assumptions(A)
+    # only save when something actually changed (avoids a DB write on every click)
+    if A != st.session_state.get("_last_assumptions"):
+        S.save_assumptions(A)
+        st.session_state["_last_assumptions"] = dict(A)
 
 if "data" not in st.session_state:
     st.info("⬅️ Load your Shopify exports to begin (folder path is easiest).")
