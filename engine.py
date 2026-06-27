@@ -107,6 +107,17 @@ def load_from_uploads(files):
     inv = pd.concat(inv_frames, ignore_index=True) if inv_frames else pd.DataFrame()
     return sales, inv, asof
 
+class _NamedBytes(io.BytesIO):
+    """BytesIO carrying a .name so the upload loader can classify it by filename."""
+    def __init__(self, data, name):
+        super().__init__(data); self.name = name
+
+def load_from_named_bytes(named_bytes):
+    """named_bytes: list of (filename, bytes) — e.g. files restored from Supabase Storage.
+    Reuses the same column-based classifier as live uploads."""
+    files = [_NamedBytes(data, name) for name, data in named_bytes]
+    return load_from_uploads(files)
+
 # ---------------------------------------------------------------- core build
 def build_sku_table(sales: pd.DataFrame, inv: pd.DataFrame, asof: pd.Timestamp) -> pd.DataFrame:
     # De-dupe inventory: if the same snapshot date is loaded twice (e.g. the same
@@ -160,10 +171,24 @@ def build_sku_table(sales: pd.DataFrame, inv: pd.DataFrame, asof: pd.Timestamp) 
                          Price=round(float(NS90.get(k, 0)) / u90, 2) if u90 > 0 else 0.0))
     return pd.DataFrame(rows)
 
-def recommend(sku: pd.DataFrame, A: dict, open_pos: pd.DataFrame, costs: dict, asof) -> pd.DataFrame:
-    """A = assumptions dict: review, lead_swim, lead_apparel, max_cover, default_cost, pack, otb."""
+def recommend(sku: pd.DataFrame, A: dict, open_pos: pd.DataFrame, costs: dict, asof,
+              setup: dict | None = None) -> pd.DataFrame:
+    """A = assumptions dict: review, lead_swim, lead_apparel, max_cover, default_cost, pack, otb.
+    setup = optional per-product overrides {product: {'category': 'swim'|'apparel', 'lead': int}}
+    from the Setup tab. Falls back to the inferred category + the sidebar lead times."""
     df = sku.copy()
-    df['Lead'] = np.where(df['Category'] == 'swim', A['lead_swim'], A['lead_apparel'])
+    setup = setup or {}
+    def _cat(r):
+        s = setup.get(r['Product'])
+        return s['category'] if (s and s.get('category') in ('swim', 'apparel')) else r['Category']
+    df['Category'] = df.apply(_cat, axis=1)
+    def _lead(r):
+        s = setup.get(r['Product'])
+        if s and s.get('lead'):
+            try: return int(s['lead'])
+            except Exception: pass
+        return A['lead_swim'] if r['Category'] == 'swim' else A['lead_apparel']
+    df['Lead'] = df.apply(_lead, axis=1)
     def pace(r):
         # Divide units by days the SKU was actually IN STOCK. If we have no
         # in-stock days (DIS30 == 0 — usually because no inventory was loaded),

@@ -1,0 +1,15 @@
+# Dark, clean theme + larger upload cap.
+# NOTE: never put secrets here — those go in .streamlit/secrets.toml (which is gitignored).
+
+[theme]
+base = "dark"
+primaryColor = "#0A84FF"
+backgroundColor = "#0B0B0F"
+secondaryBackgroundColor = "#16161C"
+textColor = "#E6E6EA"
+font = "sans serif"
+
+[server]
+# Streamlit's own per-file upload cap (MB). Default is 200; we raise it for the
+# multi-year sales export. (Supabase Storage has a separate ~50MB free-tier cap.)
+maxUploadSize = 500

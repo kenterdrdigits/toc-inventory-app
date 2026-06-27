@@ -4,7 +4,8 @@ Run:  streamlit run app.py
 Single user, CSV-driven. Point it at your Shopify exports folder (or upload files),
 set the rules, manage POs, confirm receipts, review new products, and read the order.
 """
-import os
+import os, time, hmac, hashlib
+from datetime import datetime, timedelta
 import pandas as pd
 import streamlit as st
 import engine as E
@@ -12,7 +13,44 @@ import storage as S
 
 st.set_page_config(page_title="TOC Inventory", layout="wide", page_icon="📦")
 
-# ---------------- simple password gate ----------------
+# ---------------- Apple-ish dark polish ----------------
+st.markdown("""<style>
+html, body, [class*="css"] { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif; }
+.block-container { padding-top: 2.2rem; max-width: 1320px; }
+[data-testid="stMetric"] { background:#16161C; border:1px solid #23232B; border-radius:14px; padding:14px 16px; }
+[data-testid="stMetricLabel"] p { opacity:.65; font-size:.8rem; }
+div[data-baseweb="tab-list"] { gap: 2px; }
+.stButton button, .stDownloadButton button { border-radius:10px; }
+hr { margin:.8rem 0; opacity:.25; }
+</style>""", unsafe_allow_html=True)
+
+# ---------------- login: cookie-backed (survives refresh + shared across tabs, 10-min idle) ----------------
+IDLE_SECONDS = 10 * 60
+
+def _sign(exp, secret):
+    return hmac.new(str(secret).encode(), str(exp).encode(), hashlib.sha256).hexdigest()[:32]
+
+def _make_token(secret):
+    exp = int(time.time()) + IDLE_SECONDS
+    return f"{exp}.{_sign(exp, secret)}"
+
+def _token_exp(tok, secret):
+    try:
+        e, sig = tok.split(".", 1); e = int(e)
+        return e if _sign(e, secret) == sig else None
+    except Exception:
+        return None
+
+def _cookie_mgr():
+    """An extra-streamlit-components CookieManager, or None if the component is unavailable."""
+    try:
+        import extra_streamlit_components as stx
+        if "cookie_mgr" not in st.session_state:
+            st.session_state["cookie_mgr"] = stx.CookieManager(key="toc_cookies")
+        return st.session_state["cookie_mgr"]
+    except Exception:
+        return None
+
 def check_password() -> bool:
     try:
         correct = st.secrets.get("APP_PASSWORD", None)
@@ -23,13 +61,45 @@ def check_password() -> bool:
                  "(Streamlit Cloud → Manage app → Settings → Secrets, "
                  "or locally in a file at .streamlit/secrets.toml).")
         return False
+
+    cm = _cookie_mgr()
+    # 1) cookie login — remembered across refresh; shared across browser tabs
+    if cm is not None:
+        try:
+            tok = cm.get("toc_auth")
+        except Exception:
+            tok = None
+        if tok:
+            exp = _token_exp(tok, correct)
+            if exp and time.time() < exp:
+                st.session_state["auth_ok"] = True
+                if time.time() > exp - (IDLE_SECONDS - 60):   # slide idle window, throttled ~1/min
+                    try:
+                        cm.set("toc_auth", _make_token(correct), key="auth_refresh",
+                               expires_at=datetime.now() + timedelta(hours=12))
+                    except Exception:
+                        pass
+                return True
+        elif not st.session_state.get("auth_ok") and not st.session_state.get("_cookie_settled"):
+            st.session_state["_cookie_settled"] = True   # let the cookie component mount once
+            st.info("Loading…"); st.stop()
+
+    # 2) in-session fallback (and the whole story if the cookie component is unavailable)
     if st.session_state.get("auth_ok"):
         return True
+
+    # 3) password form
     st.markdown("### 🔒 TOC Inventory — sign in")
     pw = st.text_input("Password", type="password")
     if pw:
         if pw == correct:
             st.session_state["auth_ok"] = True
+            if cm is not None:
+                try:
+                    cm.set("toc_auth", _make_token(correct), key="auth_login",
+                           expires_at=datetime.now() + timedelta(hours=12))
+                except Exception:
+                    pass
             st.rerun()
         else:
             st.error("Incorrect password.")
@@ -57,10 +127,13 @@ with st.sidebar:
                 st.error(str(ex))
     else:
         ups = st.file_uploader("Drop sales + inventory CSVs", accept_multiple_files=True, type="csv")
-        if ups and st.button("Load uploads", type="primary"):
+        if ups and st.button("Load + save uploads", type="primary"):
             try:
-                st.session_state["data"] = E.load_from_uploads(ups)
-                st.success("Loaded.")
+                S.save_uploaded_files(ups)            # persist raw files (no Shopify API needed)
+                stored = S.load_stored_bytes()        # reload the FULL saved set (history + new)
+                st.session_state["data"] = (E.load_from_named_bytes(stored) if stored
+                                            else E.load_from_uploads(ups))
+                st.success("Loaded and saved for next time.")
             except Exception as ex:
                 st.error(str(ex))
 
@@ -79,15 +152,44 @@ with st.sidebar:
         S.save_assumptions(A)
         st.session_state["_last_assumptions"] = dict(A)
 
+    st.header("3 · Saved data")
+    _stored = S.list_stored_files()
+    if _stored:
+        st.caption(f"💾 {len(_stored)} file(s) saved — auto-loads when you reopen the app.")
+        if st.button("🗑️ Clear saved data"):
+            S.clear_stored_files(); st.session_state.pop("data", None)
+            st.success("Cleared."); st.rerun()
+    else:
+        st.caption("No saved data yet. Upload files and they'll be remembered next time.")
+
+    st.divider()
+    if st.button("Log out"):
+        st.session_state["auth_ok"] = False
+        _cm = _cookie_mgr()
+        if _cm is not None:
+            try: _cm.delete("toc_auth", key="auth_logout")
+            except Exception: pass
+        st.rerun()
+
+# auto-load saved uploads so a refresh / cold start remembers your data
 if "data" not in st.session_state:
-    st.info("⬅️ Load your Shopify exports to begin (folder path is easiest).")
+    _stored = S.load_stored_bytes()
+    if _stored:
+        try:
+            st.session_state["data"] = E.load_from_named_bytes(_stored)
+        except Exception:
+            pass
+
+if "data" not in st.session_state:
+    st.info("⬅️ Load your Shopify exports to begin (or upload once — they'll be remembered).")
     st.stop()
 
 sales, inv, asof = st.session_state["data"]
 costs = S.load_costs()
 pos = S.load_pos()
+setup = S.load_setup()
 sku = E.build_sku_table(sales, inv, asof)
-rec = E.recommend(sku, A, pos, costs, asof)
+rec = E.recommend(sku, A, pos, costs, asof, setup=setup)
 cw = E.colorway_rollup(rec, A["otb"])
 asof_d = pd.to_datetime(asof).date()
 has_inv = E.has_inventory(inv)
@@ -151,7 +253,7 @@ with st.expander("🩺 Data health — is my data clean?"):
                    "set real costs in the **Unit costs** tab for accurate value & profit ranking.")
 
 tabs = st.tabs(["🛒 Order", "🔎 Audit a SKU", "🗂️ Inactive SKUs", "🚚 Open POs",
-                "✅ Receipts to confirm", "🆕 New products", "💲 Unit costs"])
+                "✅ Receipts to confirm", "🆕 New products", "💲 Unit costs", "⚙️ Setup"])
 
 # ---------------- Order (grain toggle: Product / Colorway / Size) ----------------
 with tabs[0]:
@@ -298,3 +400,37 @@ with tabs[6]:
     if st.button("💾 Save costs"):
         S.save_costs({r["product"]: float(r["unit_cost"]) for _, r in e.iterrows() if r["unit_cost"]})
         st.success("Saved."); st.rerun()
+
+# ---------------- Setup (category + lead time per product) ----------------
+with tabs[7]:
+    st.subheader("Setup — category & lead time per product")
+    st.caption("Override the swim/apparel guess and set a lead time per product. "
+               "Blank lead = use the sidebar default for that category. New products appear here automatically.")
+    prods = sorted(sku["Product"].unique())
+    base = []
+    for p in prods:
+        s = setup.get(p, {})
+        inferred = sku.loc[sku["Product"] == p, "Category"].iloc[0]
+        base.append({"product": p,
+                     "category": s.get("category") or inferred,
+                     "lead_days": s.get("lead") if s.get("lead") else None})
+    se = st.data_editor(
+        pd.DataFrame(base), use_container_width=True, hide_index=True, height=460,
+        column_config={
+            "product": st.column_config.TextColumn("product", disabled=True),
+            "category": st.column_config.SelectboxColumn("category", options=["swim", "apparel"]),
+            "lead_days": st.column_config.NumberColumn("lead_days (blank = use sidebar default)",
+                                                       min_value=1, max_value=180, step=1)})
+    if st.button("💾 Save setup"):
+        newmap = {}
+        for _, r in se.iterrows():
+            entry = {}
+            if r["category"] in ("swim", "apparel"):
+                entry["category"] = r["category"]
+            if pd.notna(r["lead_days"]) and str(r["lead_days"]).strip() != "":
+                try: entry["lead"] = int(float(r["lead_days"]))
+                except Exception: pass
+            if entry:
+                newmap[r["product"]] = entry
+        S.save_setup(newmap)
+        st.success("Saved. The order uses these on the next rerun."); st.rerun()
