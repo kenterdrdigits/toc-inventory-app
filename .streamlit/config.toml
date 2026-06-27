@@ -1,12 +1,12 @@
-# Dark, clean theme + larger upload cap.
+# Light, clean Apple-style theme + larger upload cap.
 # NOTE: never put secrets here — those go in .streamlit/secrets.toml (which is gitignored).
 
 [theme]
-base = "dark"
-primaryColor = "#0A84FF"
-backgroundColor = "#0B0B0F"
-secondaryBackgroundColor = "#16161C"
-textColor = "#E6E6EA"
+base = "light"
+primaryColor = "#0071E3"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F5F7"
+textColor = "#1D1D1F"
 font = "sans serif"
 
 [server]

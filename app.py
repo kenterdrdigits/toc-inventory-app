@@ -15,14 +15,69 @@ st.set_page_config(page_title="TOC Inventory", layout="wide", page_icon="📦")
 
 # ---------------- Apple-ish dark polish ----------------
 st.markdown("""<style>
-html, body, [class*="css"] { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif; }
-.block-container { padding-top: 2.2rem; max-width: 1320px; }
-[data-testid="stMetric"] { background:#16161C; border:1px solid #23232B; border-radius:14px; padding:14px 16px; }
-[data-testid="stMetricLabel"] p { opacity:.65; font-size:.8rem; }
-div[data-baseweb="tab-list"] { gap: 2px; }
-.stButton button, .stDownloadButton button { border-radius:10px; }
-hr { margin:.8rem 0; opacity:.25; }
+/* ---- Apple-style LIGHT polish (CSS only — no app logic changes) ---- */
+html, body, [class*="css"], [data-testid] {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Inter", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased; letter-spacing: -0.01em;
+}
+/* Roomier page, comfortable reading width */
+.block-container { padding-top: 3rem; padding-bottom: 4rem; max-width: 1320px; }
+/* Text-size hierarchy: big clean title → calmer headers → small muted labels */
+h1 { font-size: 2.4rem; font-weight: 700; letter-spacing: -0.03em; margin-bottom: .35rem; color: #1D1D1F; }
+h2 { font-size: 1.4rem; font-weight: 600; letter-spacing: -0.02em; margin-top: 1.6rem; color: #1D1D1F; }
+h3 { font-size: 1.1rem; font-weight: 600; color: #6E6E73; }
+[data-testid="stCaptionContainer"], .stCaption { color: #6E6E73; font-size: .82rem; }
+/* Metric cards: rounded corners, soft border, gentle shadow */
+[data-testid="stMetric"] {
+  background: #FFFFFF; border: 1px solid #E5E5EA; border-radius: 16px;
+  padding: 18px 20px; box-shadow: 0 1px 3px rgba(0,0,0,.06);
+}
+[data-testid="stMetricLabel"] p {
+  opacity: .55; font-size: .75rem; font-weight: 500;
+  text-transform: uppercase; letter-spacing: .05em;
+}
+[data-testid="stMetricValue"] { font-size: 1.7rem; font-weight: 600; letter-spacing: -0.02em; }
+/* Tidy tab bar: segmented-control look */
+div[data-baseweb="tab-list"] {
+  gap: 4px; background: #F5F5F7; padding: 5px;
+  border-radius: 12px; border: 1px solid #E5E5EA;
+}
+button[data-baseweb="tab"] { border-radius: 9px; padding: 6px 14px; color: #6E6E73; }
+button[data-baseweb="tab"][aria-selected="true"] {
+  background: #FFFFFF; color: #1D1D1F; box-shadow: 0 1px 2px rgba(0,0,0,.08);
+}
+div[data-baseweb="tab-highlight"], div[data-baseweb="tab-border"] { background: transparent; }
+/* Buttons + inputs */
+.stButton button, .stDownloadButton button {
+  border-radius: 10px; font-weight: 500; border: 1px solid #D2D2D7;
+}
+[data-baseweb="input"], [data-baseweb="select"] { border-radius: 10px; }
+/* Crisp tables + soft expander card */
+[data-testid="stDataFrame"], [data-testid="stTable"] {
+  border-radius: 12px; border: 1px solid #E5E5EA; overflow: hidden;
+}
+[data-testid="stExpander"] { border: 1px solid #E5E5EA; border-radius: 14px; background: #FFFFFF; }
+/* Dividers */
+hr { margin: 1.4rem 0; opacity: .12; }
 </style>""", unsafe_allow_html=True)
+
+# ---------------- speed: cache the heavy work so reruns/refreshes are instant ----------------
+# Streamlit reruns this whole file on every click. These caches let it REUSE results
+# instead of re-parsing the ~49MB sales CSV and re-running the TOC math each time.
+# Streamlit re-runs them only when the inputs actually change (new upload, changed rule),
+# so the numbers are identical — it just skips redundant work.
+@st.cache_data(show_spinner="Loading your saved data…")
+def _load_named_cached(stored):
+    return E.load_from_named_bytes(stored)
+
+@st.cache_data(show_spinner="Crunching the numbers…")
+def _compute(sales, inv, asof, A, pos, costs, setup):
+    sku = E.build_sku_table(sales, inv, asof)
+    rec = E.recommend(sku, A, pos, costs, asof, setup=setup)
+    cw = E.colorway_rollup(rec, A["otb"])
+    vs = E.value_summary(sku, costs, A["default_cost"])
+    health = E.data_health(sales, inv, asof, costs, sku)
+    return sku, rec, cw, vs, health
 
 # ---------------- login: cookie-backed (survives refresh + shared across tabs, 10-min idle) ----------------
 IDLE_SECONDS = 10 * 60
@@ -131,7 +186,7 @@ with st.sidebar:
             try:
                 S.save_uploaded_files(ups)            # persist raw files (no Shopify API needed)
                 stored = S.load_stored_bytes()        # reload the FULL saved set (history + new)
-                st.session_state["data"] = (E.load_from_named_bytes(stored) if stored
+                st.session_state["data"] = (_load_named_cached(stored) if stored
                                             else E.load_from_uploads(ups))
                 st.success("Loaded and saved for next time.")
             except Exception as ex:
@@ -176,7 +231,7 @@ if "data" not in st.session_state:
     _stored = S.load_stored_bytes()
     if _stored:
         try:
-            st.session_state["data"] = E.load_from_named_bytes(_stored)
+            st.session_state["data"] = _load_named_cached(_stored)
         except Exception:
             pass
 
@@ -188,13 +243,9 @@ sales, inv, asof = st.session_state["data"]
 costs = S.load_costs()
 pos = S.load_pos()
 setup = S.load_setup()
-sku = E.build_sku_table(sales, inv, asof)
-rec = E.recommend(sku, A, pos, costs, asof, setup=setup)
-cw = E.colorway_rollup(rec, A["otb"])
+sku, rec, cw, vs, health = _compute(sales, inv, asof, A, pos, costs, setup)
 asof_d = pd.to_datetime(asof).date()
 has_inv = E.has_inventory(inv)
-vs = E.value_summary(sku, costs, A["default_cost"])
-health = E.data_health(sales, inv, asof, costs, sku)
 
 def _short(d):
     if d is None: return "—"
