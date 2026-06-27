@@ -139,13 +139,21 @@ def build_sku_table(sales: pd.DataFrame, inv: pd.DataFrame, asof: pd.Timestamp) 
         w30 = [d.strftime('%Y-%m-%d') for d in didx if d >= asof - pd.Timedelta(days=29)]
         dis30 = (mat[w30] > 0).sum(axis=1)
 
+    # map each SKU key -> its real Shopify variant code (most common non-null in sales)
+    code_map = {}
+    if 'Product variant SKU' in sales.columns:
+        cc = sales.dropna(subset=['Product variant SKU'])
+        if len(cc):
+            code_map = cc.groupby('key')['Product variant SKU'].agg(
+                lambda s: s.astype(str).value_counts().index[0]).to_dict()
+
     keys = sorted(set(U[90][U[90] > 0].index) | set(latest_oh[latest_oh > 0].index))
     rows = []
     for k in keys:
         P, C, S = k.split(' | ', 2)
         if NONMERCH.search(P): continue
         u30, u60, u90 = float(U[30].get(k, 0)), float(U[60].get(k, 0)), float(U[90].get(k, 0))
-        rows.append(dict(key=k, Product=P, Color=C, Size=S, Bucket=size_bucket(S),
+        rows.append(dict(key=k, SKU=code_map.get(k, ''), Product=P, Color=C, Size=S, Bucket=size_bucket(S),
                          Category='swim' if SWIM.search(P) else 'apparel',
                          OnHand=float(latest_oh.get(k, 0)), U30=u30, U60=u60, U90=u90,
                          DIS30=int(dis30.get(k, 0)),
@@ -208,6 +216,23 @@ def colorway_rollup(rec: pd.DataFrame, otb: float) -> pd.DataFrame:
     cw['InBudget'] = np.where(cw['Order'] == 0, '—', np.where(cw['CumCost'] <= otb, 'BUY', 'DEFER'))
     return cw
 
+def product_rollup(rec: pd.DataFrame, cw: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Roll the size-level recommendation up to the PRODUCT level (across all colorways)."""
+    pr = rec.groupby('Product').agg(
+        Pace=('Pace','sum'), OnHand=('OnHand','sum'), OnOrder=('OnOrder','sum'),
+        ReorderPt=('ReorderPt','sum'), Order=('Order','sum'),
+        ProfitVelocity=('ProfitVelocity','sum'), OrderCost=('OrderCost','sum')).reset_index()
+    piv = rec.pivot_table(index='Product', columns='Bucket', values='Order',
+                          aggfunc='sum', fill_value=0).reset_index()
+    for b in SIZE_BUCKETS:
+        if b not in piv.columns: piv[b] = 0
+    pr = pr.merge(piv[['Product'] + SIZE_BUCKETS], on='Product', how='left')
+    pr['Colorways'] = rec.groupby('Product')['Color'].nunique().reindex(pr['Product']).values
+    if cw is not None and 'InBudget' in cw.columns:
+        buy = cw[cw['InBudget'] == 'BUY'].groupby('Product')['Color'].nunique()
+        pr['BuyColorways'] = pr['Product'].map(buy).fillna(0).astype(int)
+    return pr.sort_values(['Order','ProfitVelocity'], ascending=False)
+
 # ---------------------------------------------------------------- reconciliation
 def detect_receipts(inv: pd.DataFrame, open_pos: pd.DataFrame, tol_frac=0.25) -> pd.DataFrame:
     """Compare the two most recent inventory snapshots; positive on-hand jumps that match an
@@ -236,6 +261,41 @@ def detect_receipts(inv: pd.DataFrame, open_pos: pd.DataFrame, tol_frac=0.25) ->
 
 def detect_new_products(sku: pd.DataFrame, costs: dict) -> list[str]:
     return sorted(set(sku['Product']) - set(costs.keys()))
+
+def inactive_skus(sales: pd.DataFrame, inv: pd.DataFrame, asof, recent_days: int = 90) -> pd.DataFrame:
+    """SKUs that sold at some point in history but have NO sales in the last `recent_days`
+    and NO current on-hand — i.e. dormant / discontinued. The active table excludes these,
+    so we surface them here with last-sold, days-since, and lifetime units."""
+    if sales is None or sales.empty:
+        return pd.DataFrame(columns=['key','SKU','Product','Color','Size','LastSold','DaysSince','LifetimeUnits','OnHand'])
+    asof = pd.to_datetime(asof)
+    g = sales.groupby('key')
+    last_sold = g['Day'].max()
+    life_units = g['units'].sum()
+    rec = sales[sales['Day'] >= asof - pd.Timedelta(days=recent_days - 1)].groupby('key')['units'].sum()
+    if has_inventory(inv):
+        ld = inv['date'].max()
+        oh = inv[inv['date'] == ld].groupby('key')['oh'].sum()
+    else:
+        oh = pd.Series(dtype=float)
+    codes = {}
+    if 'Product variant SKU' in sales.columns:
+        cc = sales.dropna(subset=['Product variant SKU'])
+        if len(cc):
+            codes = cc.groupby('key')['Product variant SKU'].agg(
+                lambda s: s.astype(str).value_counts().index[0]).to_dict()
+    rows = []
+    for k in last_sold.index:
+        if float(rec.get(k, 0)) > 0 or float(oh.get(k, 0)) > 0:
+            continue
+        P, C, S = k.split(' | ', 2)
+        if NONMERCH.search(P): continue
+        rows.append(dict(key=k, SKU=codes.get(k, ''), Product=P, Color=C, Size=S,
+                         LastSold=pd.to_datetime(last_sold[k]).date(),
+                         DaysSince=int((asof - pd.to_datetime(last_sold[k])).days),
+                         LifetimeUnits=float(life_units.get(k, 0)), OnHand=float(oh.get(k, 0))))
+    df = pd.DataFrame(rows)
+    return df.sort_values('LastSold', ascending=False) if len(df) else df
 
 # ---------------------------------------------------------------- data health & value
 def has_inventory(inv: pd.DataFrame) -> bool:

@@ -150,44 +150,64 @@ with st.expander("🩺 Data health — is my data clean?"):
         st.caption(f"💲 {len(mc)} product(s) using the ${A['default_cost']:.0f} default cost — "
                    "set real costs in the **Unit costs** tab for accurate value & profit ranking.")
 
-tabs = st.tabs(["🛒 Order", "🔬 By size", "🔎 Audit a SKU", "🚚 Open POs",
+tabs = st.tabs(["🛒 Order", "🔎 Audit a SKU", "🗂️ Inactive SKUs", "🚚 Open POs",
                 "✅ Receipts to confirm", "🆕 New products", "💲 Unit costs"])
 
-# ---------------- Order (colorway) ----------------
+# ---------------- Order (grain toggle: Product / Colorway / Size) ----------------
 with tabs[0]:
-    st.subheader("Recommended order — by colorway (funded by Open-to-Buy)")
+    st.subheader("Recommended order")
     if not has_inv:
         st.warning("Quantities assume **0 on-hand** until you load inventory — treat this as a preview.")
-    show = cw[["Product","Color","Pace","OnHand","OnOrder","ReorderPt","Order",
-               "XS","S","M","L","XL","Oth","ProfitVelocity","OrderCost","CumCost","InBudget"]].copy()
-    show = show.round({"Pace":2,"ProfitVelocity":1,"OrderCost":0,"CumCost":0})
-    st.dataframe(show, use_container_width=True, height=460)
-    buy = cw[cw["InBudget"] == "BUY"]
-    factory = buy.assign(Date=str(asof_d),
-                         **{"Style No.": ["YM-%04d" % i for i in range(1000, 1000+len(buy))]})
-    factory = factory[["Date","Style No.","Product","Color","XS","S","M","L","XL","Oth","Order"]]\
-        .rename(columns={"Order":"Total"})
-    st.download_button("⬇️ Download Factory PO (this week's BUY rows)",
-                       factory.to_csv(index=False).encode(), "factory_po.csv", "text/csv")
+    gc1, gc2 = st.columns([2, 3])
+    grain = gc1.radio("View by", ["Product", "Colorway", "Size"], index=1, horizontal=True)
+    pick = gc2.selectbox("Filter to a product", ["(all products)"] + sorted(rec["Product"].unique()))
+    rf = rec if pick == "(all products)" else rec[rec["Product"] == pick]
 
-# ---------------- By size ----------------
-with tabs[1]:
-    st.subheader("Size-level engine — each SKU its own reorder point")
-    if not has_inv:
-        st.warning("Quantities assume **0 on-hand** until you load inventory — treat this as a preview.")
-    prod = st.selectbox("Filter to a product (optional)", ["(all)"] + sorted(rec["Product"].unique()))
-    d = rec if prod == "(all)" else rec[rec["Product"] == prod]
-    st.dataframe(d[["Product","Color","Size","Pace","DIS30","OnHand","OnOrder","ReorderPt",
-                    "Order","Zone","UnitCost","Price","ProfitVelocity"]]
-                 .round({"Pace":2,"ProfitVelocity":1}).sort_values("Order", ascending=False),
-                 use_container_width=True, height=460)
+    if grain == "Product":
+        pr = E.product_rollup(rf, cw)
+        cols = ["Product","Colorways","Pace","OnHand","OnOrder","ReorderPt","Order",
+                "XS","S","M","L","XL","Oth","ProfitVelocity","OrderCost"]
+        if "BuyColorways" in pr.columns: cols.insert(2, "BuyColorways")
+        st.dataframe(pr[cols].round({"Pace":2,"ProfitVelocity":1,"OrderCost":0}),
+                     use_container_width=True, height=460)
+        st.caption("Totals across every colorway of each product. BUY/DEFER is decided at the colorway level.")
+    elif grain == "Colorway":
+        cwf = cw if pick == "(all products)" else cw[cw["Product"] == pick]
+        show = cwf[["Product","Color","Pace","OnHand","OnOrder","ReorderPt","Order",
+                    "XS","S","M","L","XL","Oth","ProfitVelocity","OrderCost","CumCost","InBudget"]].copy()
+        st.dataframe(show.round({"Pace":2,"ProfitVelocity":1,"OrderCost":0,"CumCost":0}),
+                     use_container_width=True, height=460)
+    else:  # Size — each SKU its own reorder point, with its real code + buffer zone
+        sz = rf.merge(cw[["Product","Color","InBudget"]], on=["Product","Color"], how="left")
+        cols = ["SKU","Product","Color","Size","Pace","DIS30","OnHand","OnOrder","ReorderPt",
+                "Order","Zone","InBudget","UnitCost","Price","ProfitVelocity"]
+        st.dataframe(sz[cols].round({"Pace":2,"ProfitVelocity":1}).sort_values("Order", ascending=False),
+                     use_container_width=True, height=460)
+
+    st.divider()
+    # ---- Factory PO downloads (this week's funded BUY rows) ----
+    buy_sizes = rec.merge(cw[cw["InBudget"] == "BUY"][["Product","Color"]],
+                          on=["Product","Color"], how="inner")
+    buy_sizes = buy_sizes[buy_sizes["Order"] > 0]
+    d1, d2 = st.columns(2)
+    po_sku = buy_sizes.assign(Date=str(asof_d))[["Date","SKU","Product","Color","Size","Order"]]\
+        .rename(columns={"Order":"Qty"}).sort_values(["Product","Color","Size"])
+    d1.download_button("⬇️ Factory PO — by SKU (with codes)",
+                       po_sku.to_csv(index=False).encode(), "factory_po_by_sku.csv", "text/csv",
+                       help="One row per SKU with its real Shopify code — the order you hand the factory.")
+    buy = cw[cw["InBudget"] == "BUY"]
+    factory = buy.assign(Date=str(asof_d))[
+        ["Date","Product","Color","XS","S","M","L","XL","Oth","Order"]].rename(columns={"Order":"Total"})
+    d2.download_button("⬇️ Factory PO — by colorway (size grid)",
+                       factory.to_csv(index=False).encode(), "factory_po_by_colorway.csv", "text/csv")
 
 # ---------------- Audit ----------------
-with tabs[2]:
+with tabs[1]:
     st.subheader("Audit any SKU — does the pace ignore stockout days?")
     keys = sorted(rec["key"].unique())
     k = st.selectbox("Pick a SKU (Product | Color | Size)", keys)
     r = rec[rec["key"] == k].iloc[0]
+    st.caption(f"SKU code: **{r['SKU'] or '—'}**")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Days in stock (30)", int(r["DIS30"]))
     m2.metric("Units sold (30d)", int(r["U30"]))
@@ -200,6 +220,32 @@ with tabs[2]:
     chart = pd.DataFrame({"Units sold": ds.reindex(idx).fillna(0),
                           "On hand": di.reindex(idx).ffill().fillna(0)}, index=idx)
     st.line_chart(chart)
+
+# ---------------- Inactive SKUs ----------------
+with tabs[2]:
+    st.subheader("Inactive SKUs — sold before, quiet now (no sales in 90 days, no stock)")
+    # cache per data-load (scans full history) so it doesn't recompute on every click
+    _ck = ("inactive", str(asof), len(sales))
+    if st.session_state.get("_inactive_key") != _ck:
+        st.session_state["_inactive_df"] = E.inactive_skus(sales, inv, asof)
+        st.session_state["_inactive_key"] = _ck
+    inactive = st.session_state["_inactive_df"]
+    if inactive.empty:
+        st.success("No inactive SKUs — everything with history is either selling or in stock.")
+    else:
+        st.caption(f"{len(inactive):,} dormant SKUs, most-recently-sold first. Pick one below to see its history.")
+        st.dataframe(inactive[["SKU","Product","Color","Size","LastSold","DaysSince","LifetimeUnits","OnHand"]],
+                     use_container_width=True, height=320)
+        ikey = st.selectbox("Drill into a SKU", inactive["key"].tolist())
+        ir = inactive[inactive["key"] == ikey].iloc[0]
+        dd1, dd2, dd3 = st.columns(3)
+        dd1.metric("Last sold", str(ir["LastSold"]))
+        dd2.metric("Days since", int(ir["DaysSince"]))
+        dd3.metric("Lifetime units", f"{ir['LifetimeUnits']:,.0f}")
+        st.caption(f"SKU code: **{ir['SKU'] or '—'}**")
+        hist = sales[sales["key"] == ikey].groupby("Day")["units"].sum()
+        if len(hist):
+            st.line_chart(hist.rename("Units sold"))
 
 # ---------------- Open POs ----------------
 with tabs[3]:
