@@ -135,13 +135,19 @@ def check_password() -> bool:
             st.error("Incorrect password.")
     return False
 
-if not check_password():
+# Password gate is OFF for now (the cookie component was the slow part of sign-in).
+# Flip to True to re-enable it.
+REQUIRE_LOGIN = False
+if REQUIRE_LOGIN and not check_password():
     st.stop()
 
-# ---------------- settings + persisted small tables ----------------
-A = S.load_assumptions()
-costs = S.load_costs()
-pos = S.load_pos()
+# ---------------- settings + persisted small tables (cached: no DB hit per rerun) ----------------
+@st.cache_data(show_spinner=False)
+def _load_small():
+    return S.load_assumptions(), S.load_costs(), S.load_pos()
+
+_a, _c, _p = _load_small()
+A = dict(_a); costs = dict(_c); pos = _p.copy()
 
 # ---------------- load canonical datasets into the session (cold start only) ----------------
 def _assemble_into_session(sales_df, inv_df):
@@ -250,6 +256,24 @@ def _upload_widget(key):
 def _csv_download(label, df, filename, key):
     st.download_button(label, df.to_csv(index=False).encode(), filename, "text/csv", key=key)
 
+def _hierarchical_buy(rec, cw):
+    """Product roll-up rows, each followed by its per-size detail rows (granular order).
+    One scrollable table: product pace/order on top, every size's pace underneath."""
+    prod = E.product_rollup(rec, cw)  # already sorted by Order, then ProfitVelocity
+    rows = []
+    for _, p in prod.iterrows():
+        rows.append({"Item": p["Product"], "Pace": round(p["Pace"], 2),
+                     "DIS30": None, "OnHand": p["OnHand"], "OnOrder": p["OnOrder"],
+                     "ReorderPt": round(p["ReorderPt"]), "Order": p["Order"], "Zone": "",
+                     "Return/day": round(p["ProfitVelocity"], 1)})
+        sizes = rec[rec["Product"] == p["Product"]].sort_values("Order", ascending=False)
+        for _, s in sizes.iterrows():
+            rows.append({"Item": f"    ↳ {s['Color']} · {s['Size']}", "Pace": round(s["Pace"], 2),
+                         "DIS30": int(s["DIS30"]), "OnHand": s["OnHand"], "OnOrder": s["OnOrder"],
+                         "ReorderPt": round(s["ReorderPt"]), "Order": s["Order"], "Zone": s["Zone"],
+                         "Return/day": round(s["ProfitVelocity"], 1)})
+    return pd.DataFrame(rows)
+
 # ---------------- sidebar: navigation (persists across reruns) ----------------
 VIEWS = ["🏠 Start here", "🧾 Sales", "📦 Inventory", "🛒 Buy list",
          "🔎 Audit a SKU", "🚚 Open POs", "💲 Costs"]
@@ -259,7 +283,7 @@ with st.sidebar:
     st.divider()
     if HAS_DATA:
         st.caption(f"Window: {_short(health['sales_min'])} → {_short(health['sales_max'])}")
-    if st.button("Log out", use_container_width=True):
+    if REQUIRE_LOGIN and st.button("Log out", use_container_width=True):
         st.session_state["auth_ok"] = False
         _cm = _cookie_mgr()
         if _cm is not None:
@@ -297,6 +321,7 @@ if nav == VIEWS[0]:
     if {k: A.get(k) for k in _keys} != st.session_state.get("_last_assumptions"):
         S.save_assumptions(A)
         st.session_state["_last_assumptions"] = {k: A.get(k) for k in _keys}
+        _load_small.clear()
 
     st.divider()
     st.subheader("Status")
@@ -374,17 +399,15 @@ elif nav == VIEWS[3]:
         st.caption("Sorted by priority and funded top-down to your weekly budget. "
                    "**Return/day** = pace × profit per unit. **BUY** = funded; **HOLD** = waits.")
         gc1, gc2 = st.columns([2, 3])
-        grain = gc1.radio("View by", ["Colorway", "Size", "Product"], index=0, horizontal=True, key="grain")
+        grain = gc1.radio("View by", ["Product + sizes", "Colorway", "Size"], index=0, horizontal=True, key="grain")
         pick = gc2.selectbox("Filter to a product", ["(all products)"] + sorted(rec["Product"].unique()), key="buy_pick")
         rf = rec if pick == "(all products)" else rec[rec["Product"] == pick]
 
-        if grain == "Product":
-            out = E.product_rollup(rf, cw)
-            cols = ["Product", "Colorways", "Pace", "OnHand", "OnOrder", "ReorderPt", "Order",
-                    "XS", "S", "M", "L", "XL", "Oth", "ProfitVelocity", "OrderCost"]
-            if "BuyColorways" in out.columns: cols.insert(2, "BuyColorways")
-            out = out[cols].round({"Pace": 2, "ProfitVelocity": 1, "OrderCost": 0}).rename(columns={"ProfitVelocity": "Return/day"})
-            st.caption("Totals across every colorway of each product. BUY/HOLD is decided at the colorway level.")
+        if grain == "Product + sizes":
+            cwf = cw if pick == "(all products)" else cw[cw["Product"] == pick]
+            out = _hierarchical_buy(rf, cwf)
+            st.caption("Each product's total pace/order on top, with every size's pace + order underneath — "
+                       "the granular detail behind the order.")
         elif grain == "Colorway":
             cwf = cw if pick == "(all products)" else cw[cw["Product"] == pick]
             out = cwf[["Product", "Color", "Pace", "OnHand", "OnOrder", "ReorderPt", "Order",
@@ -399,7 +422,8 @@ elif nav == VIEWS[3]:
                 .rename(columns={"ProfitVelocity": "Return/day", "InBudget": "Order?"})\
                 .sort_values("Order", ascending=False)
 
-        _csv_download("⬇️ Export this buy list (CSV)", out, f"buy_list_{grain.lower()}.csv", "dl_buy")
+        _slug = grain.lower().replace(" + ", "_").replace(" ", "_")
+        _csv_download("⬇️ Export this buy list (CSV)", out, f"buy_list_{_slug}.csv", "dl_buy")
         st.dataframe(out, use_container_width=True, height=460, hide_index=True)
 
         st.divider()
@@ -469,7 +493,7 @@ elif nav == VIEWS[5]:
     if st.button("💾 Save POs"):
         received = pos[pos["status"] == "received"] if len(pos) else pos
         S.save_pos(pd.concat([edited, received], ignore_index=True))
-        st.success("Saved."); st.rerun()
+        _load_small.clear(); _compute.clear(); st.success("Saved."); st.rerun()
 
     st.divider()
     st.markdown("**Receipts to confirm** — arrivals detected from your inventory snapshots")
@@ -485,7 +509,8 @@ elif nav == VIEWS[5]:
                 cc1.write(f"**{c['product']} · {c['color']} · {c['size']}** — on-hand jumped **+{int(c['jump'])}** "
                           f"on {c['jump_date']}, matches open PO of **{int(c['po_qty'])}**.")
                 if cc2.button("Confirm received", key="rcv_" + str(c['po_id'])):
-                    S.mark_received(c['po_id']); st.success("Marked received."); st.rerun()
+                    S.mark_received(c['po_id']); _load_small.clear(); _compute.clear()
+                    st.success("Marked received."); st.rerun()
 
 # ================= Costs =================
 elif nav == VIEWS[6]:
@@ -509,7 +534,7 @@ elif nav == VIEWS[6]:
                                           "cost set?": st.column_config.TextColumn("cost set?", disabled=True)})
         if st.button("💾 Save costs"):
             S.save_costs({r["product"]: float(r["unit_cost"]) for _, r in e.iterrows() if r["unit_cost"]})
-            st.success("Saved."); st.rerun()
+            _load_small.clear(); _compute.clear(); st.success("Saved."); st.rerun()
 
         st.divider()
         with st.expander("Inactive / dead stock (no sales in 90 days, no stock)"):
