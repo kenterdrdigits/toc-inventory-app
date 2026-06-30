@@ -171,55 +171,47 @@ def build_sku_table(sales: pd.DataFrame, inv: pd.DataFrame, asof: pd.Timestamp) 
                          Price=round(float(NS90.get(k, 0)) / u90, 2) if u90 > 0 else 0.0))
     return pd.DataFrame(rows)
 
-def recommend(sku: pd.DataFrame, A: dict, open_pos: pd.DataFrame, costs: dict, asof,
-              setup: dict | None = None) -> pd.DataFrame:
-    """A = assumptions dict: review, lead_swim, lead_apparel, max_cover, default_cost, pack, otb.
-    setup = optional per-product overrides {product: {'category': 'swim'|'apparel', 'lead': int}}
-    from the Setup tab. Falls back to the inferred category + the sidebar lead times."""
+def recommend(sku: pd.DataFrame, A: dict, open_pos: pd.DataFrame, costs: dict, asof) -> pd.DataFrame:
+    """A = assumptions dict: review, lead, default_cost, pack, otb.
+    One lead time for every SKU (no swim/apparel split), no max-cover cap.
+    Fully vectorized — no row-wise apply."""
     df = sku.copy()
-    setup = setup or {}
-    def _cat(r):
-        s = setup.get(r['Product'])
-        return s['category'] if (s and s.get('category') in ('swim', 'apparel')) else r['Category']
-    df['Category'] = df.apply(_cat, axis=1)
-    def _lead(r):
-        s = setup.get(r['Product'])
-        if s and s.get('lead'):
-            try: return int(s['lead'])
-            except Exception: pass
-        return A['lead_swim'] if r['Category'] == 'swim' else A['lead_apparel']
-    df['Lead'] = df.apply(_lead, axis=1)
-    def pace(r):
-        # Divide units by days the SKU was actually IN STOCK. If we have no
-        # in-stock days (DIS30 == 0 — usually because no inventory was loaded),
-        # fall back to calendar days so we never divide a whole month by 1 day.
-        if r.U30 > 0: return r.U30 / (r.DIS30 if r.DIS30 > 0 else 30)
-        if r.U60 > 0: return r.U60 / 60
-        if r.U90 > 0: return r.U90 / 90
-        return 0.0
-    df['Pace'] = df.apply(pace, axis=1)
-    df['ReorderPt'] = np.minimum(df['Pace'] * (df['Lead'] + A['review']), df['Pace'] * A['max_cover'])
-    # ETA-aware on-order from open POs (status == in_transit, ETA within lead+review)
+    lead = int(A['lead'])
+    df['Lead'] = lead
+
+    # Pace = units sold ÷ days the SKU was actually IN STOCK. If there are no
+    # in-stock days (DIS30 == 0, usually because no inventory was loaded), fall
+    # back to calendar days so we never divide a whole month by 1 day.
+    dis = df['DIS30'].where(df['DIS30'] > 0, 30)
+    df['Pace'] = np.select(
+        [df['U30'] > 0, df['U60'] > 0, df['U90'] > 0],
+        [df['U30'] / dis, df['U60'] / 60, df['U90'] / 90],
+        default=0.0)
+    df['ReorderPt'] = df['Pace'] * (lead + A['review'])
+
+    # ETA-aware on-order from open POs (status == in_transit, ETA within lead+review).
+    # Vectorized: sum each PO's qty onto its SKU key via groupby + map.
+    df['OnOrder'] = 0.0
     if open_pos is not None and len(open_pos):
         op = open_pos.copy()
         op = op[op.get('status', 'in_transit').fillna('in_transit') == 'in_transit']
         op['eta'] = pd.to_datetime(op['eta'], errors='coerce')
         op['qty'] = pd.to_numeric(op['qty'], errors='coerce').fillna(0)
         op['key'] = op['product'].astype(str)+' | '+op['color'].astype(str)+' | '+op['size'].map(clean_size)
-        def onorder(r):
-            cutoff = asof + pd.Timedelta(days=int(r.Lead) + int(A['review']))
-            m = op[(op['key'] == r.key) & ((op['eta'].isna()) | (op['eta'] <= cutoff))]
-            return float(m['qty'].sum())
-        df['OnOrder'] = df.apply(onorder, axis=1)
-    else:
-        df['OnOrder'] = 0.0
+        cutoff = asof + pd.Timedelta(days=lead + int(A['review']))
+        op = op[op['eta'].isna() | (op['eta'] <= cutoff)]
+        if len(op):
+            df['OnOrder'] = df['key'].map(op.groupby('key')['qty'].sum()).fillna(0.0)
+
     pack = max(int(A['pack']), 1)
     df['Order'] = np.ceil(np.maximum(0, df['ReorderPt'] - df['OnHand'].clip(lower=0) - df['OnOrder']) / pack) * pack
-    def zone(r):
-        if r.ReorderPt <= 0: return '—'
-        p = (max(r.OnHand, 0) + r.OnOrder) / r.ReorderPt
-        return 'RED' if p < 1/3 else 'YELLOW' if p < 2/3 else 'GREEN' if p <= 1 else 'OVER'
-    df['Zone'] = df.apply(zone, axis=1)
+
+    # Buffer zone (how covered each SKU is vs its reorder point)
+    cover = (df['OnHand'].clip(lower=0) + df['OnOrder']) / df['ReorderPt'].where(df['ReorderPt'] > 0, np.nan)
+    df['Zone'] = np.select(
+        [df['ReorderPt'] <= 0, cover < 1/3, cover < 2/3, cover <= 1],
+        ['—', 'RED', 'YELLOW', 'GREEN'], default='OVER')
+
     df['UnitCost'] = df['Product'].map(lambda p: costs.get(p) if costs.get(p) else A['default_cost'])
     df['ProfitPerUnit'] = (df['Price'] - df['UnitCost']).clip(lower=0)
     df['ProfitVelocity'] = df['Pace'] * df['ProfitPerUnit']

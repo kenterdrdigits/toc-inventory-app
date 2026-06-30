@@ -19,8 +19,9 @@ EXPORTS_DIR = os.path.join(DATA_DIR, "exports")        # local fallback for stor
 EXPORTS_BUCKET = "exports"                              # Supabase Storage bucket name
 
 PO_COLS = ["po_id", "product", "color", "size", "qty", "eta", "status", "note"]
-DEFAULT_ASSUMPTIONS = dict(review=7, lead_swim=14, lead_apparel=21, max_cover=30,
-                           default_cost=7.0, pack=1, otb=50000)
+# Four numbers + pack/MOQ (mirrors the Open-to-Buy Excel tool). One lead time for
+# everything — no swim/apparel split, no max-cover cap.
+DEFAULT_ASSUMPTIONS = dict(review=7, lead=21, default_cost=7.0, pack=1, otb=50000)
 
 # ---------------------------------------------------------------- Supabase client
 _cache = "unset"
