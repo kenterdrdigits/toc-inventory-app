@@ -259,6 +259,72 @@ def load_stored_bytes() -> list:
             return []
     return out
 
+# ---------------------------------------------------------------- canonical datasets (Parquet)
+# One processed sales table + one processed inventory table, stored as compressed
+# Parquet. Much smaller than the raw CSV (clears the ~50MB Storage cap) and fast to
+# reload. Falls back to local ./data/*.parquet when Supabase isn't configured.
+DATASET_FILES = {"sales": "sales.parquet", "inventory": "inventory.parquet"}
+
+def load_dataset(kind: str):
+    """Return the processed DataFrame for 'sales'/'inventory', or None if not saved."""
+    name = DATASET_FILES[kind]
+    c = _sb()
+    if c:
+        try:
+            data = c.storage.from_(EXPORTS_BUCKET).download(name)
+            return pd.read_parquet(io.BytesIO(data))
+        except Exception:
+            pass
+    p = os.path.join(DATA_DIR, name)
+    if os.path.exists(p):
+        try:
+            return pd.read_parquet(p)
+        except Exception:
+            return None
+    return None
+
+def save_dataset(kind: str, df: pd.DataFrame) -> bool:
+    """Persist a processed DataFrame as Parquet. Returns True on success."""
+    name = DATASET_FILES[kind]
+    try:
+        data = df.to_parquet(index=False)
+    except Exception:
+        return False
+    c = _sb()
+    if c:
+        try:
+            _ensure_bucket(c)
+            c.storage.from_(EXPORTS_BUCKET).upload(
+                path=name, file=data,
+                file_options={"content-type": "application/octet-stream", "upsert": "true"})
+            return True
+        except Exception:
+            pass
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(os.path.join(DATA_DIR, name), "wb") as out:
+            out.write(data)
+        return True
+    except Exception:
+        return False
+
+def clear_datasets() -> bool:
+    ok = True
+    c = _sb()
+    names = list(DATASET_FILES.values())
+    if c:
+        try:
+            c.storage.from_(EXPORTS_BUCKET).remove(names)
+        except Exception:
+            ok = False
+    for n in names:
+        p = os.path.join(DATA_DIR, n)
+        try:
+            if os.path.exists(p): os.remove(p)
+        except Exception:
+            ok = False
+    return ok
+
 def clear_stored_files() -> bool:
     c = _sb()
     if c:

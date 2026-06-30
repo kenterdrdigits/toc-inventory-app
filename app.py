@@ -2,14 +2,14 @@
 TOC Inventory — Streamlit app.
 Run:  streamlit run app.py
 
-Simple, Excel-style flow that mirrors the Open-to-Buy tool:
-  Start here → Sales → Inventory → Buy list → Audit a SKU → Open POs → Costs
-Paste your Shopify exports, set four numbers, read the buy list. The one bit of
-extra smarts over a spreadsheet: pace is units sold ÷ days actually in stock, so
-stockouts don't make a fast seller look slow.
+Simple flow with a persistent left-side menu:
+  Start here · Sales · Inventory · Buy list · Audit a SKU · Open POs · Costs
+Upload your Shopify exports (CSV), set five numbers, read the buy list. Data is
+parsed + date-stamped once and stored as compact Parquet, so reloads are fast.
+The smarts over a spreadsheet: pace is units sold ÷ days actually in stock.
 """
 import os, time, hmac, hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date as _date
 import pandas as pd
 import streamlit as st
 import engine as E
@@ -17,52 +17,39 @@ import storage as S
 
 st.set_page_config(page_title="TOC Inventory", layout="wide", page_icon="📦")
 
-# ---------------- Apple-style light polish (CSS only — no app logic) ----------------
+# ---------------- Apple-style DARK polish (CSS only — no app logic) ----------------
 st.markdown("""<style>
 html, body, [class*="css"], [data-testid] {
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Inter", system-ui, sans-serif;
   -webkit-font-smoothing: antialiased; letter-spacing: -0.01em;
 }
-.block-container { padding-top: 3rem; padding-bottom: 4rem; max-width: 1320px; }
-h1 { font-size: 2.4rem; font-weight: 700; letter-spacing: -0.03em; margin-bottom: .35rem; color: #1D1D1F; }
-h2 { font-size: 1.4rem; font-weight: 600; letter-spacing: -0.02em; margin-top: 1.6rem; color: #1D1D1F; }
-h3 { font-size: 1.1rem; font-weight: 600; color: #6E6E73; }
-[data-testid="stCaptionContainer"], .stCaption { color: #6E6E73; font-size: .82rem; }
+.block-container { padding-top: 2.6rem; padding-bottom: 4rem; max-width: 1320px; }
+h1 { font-size: 2.4rem; font-weight: 700; letter-spacing: -0.03em; margin-bottom: .35rem; color: #F5F5F7; }
+h2 { font-size: 1.4rem; font-weight: 600; letter-spacing: -0.02em; margin-top: 1.4rem; color: #F5F5F7; }
+h3 { font-size: 1.1rem; font-weight: 600; color: #C7C7CF; }
+[data-testid="stCaptionContainer"], .stCaption { color: #8A8A93; font-size: .82rem; }
 [data-testid="stMetric"] {
-  background: #FFFFFF; border: 1px solid #E5E5EA; border-radius: 16px;
-  padding: 18px 20px; box-shadow: 0 1px 3px rgba(0,0,0,.06);
+  background: #16161C; border: 1px solid #23232B; border-radius: 16px;
+  padding: 18px 20px; box-shadow: 0 1px 3px rgba(0,0,0,.25);
 }
 [data-testid="stMetricLabel"] p {
-  opacity: .55; font-size: .75rem; font-weight: 500;
+  opacity: .6; font-size: .75rem; font-weight: 500;
   text-transform: uppercase; letter-spacing: .05em;
 }
 [data-testid="stMetricValue"] { font-size: 1.7rem; font-weight: 600; letter-spacing: -0.02em; }
-div[data-baseweb="tab-list"] {
-  gap: 4px; background: #F5F5F7; padding: 5px;
-  border-radius: 12px; border: 1px solid #E5E5EA;
-}
-button[data-baseweb="tab"] { border-radius: 9px; padding: 6px 14px; color: #6E6E73; }
-button[data-baseweb="tab"][aria-selected="true"] {
-  background: #FFFFFF; color: #1D1D1F; box-shadow: 0 1px 2px rgba(0,0,0,.08);
-}
-div[data-baseweb="tab-highlight"], div[data-baseweb="tab-border"] { background: transparent; }
+section[data-testid="stSidebar"] { background: #121217; border-right: 1px solid #23232B; }
 .stButton button, .stDownloadButton button {
-  border-radius: 10px; font-weight: 500; border: 1px solid #D2D2D7;
+  border-radius: 10px; font-weight: 500; border: 1px solid #2A2A33;
 }
 [data-baseweb="input"], [data-baseweb="select"] { border-radius: 10px; }
-[data-testid="stDataFrame"], [data-testid="stTable"] {
-  border-radius: 12px; border: 1px solid #E5E5EA; overflow: hidden;
-}
-[data-testid="stExpander"] { border: 1px solid #E5E5EA; border-radius: 14px; background: #FFFFFF; }
-hr { margin: 1.4rem 0; opacity: .12; }
+[data-testid="stDataFrame"] { border-radius: 12px; border: 1px solid #23232B; overflow: hidden; }
+[data-testid="stExpander"] { border: 1px solid #23232B; border-radius: 14px; background: #15151B; }
+[data-testid="stExpander"] summary { padding: 4px 2px; }
+hr { margin: 1.2rem 0; opacity: .18; }
 </style>""", unsafe_allow_html=True)
 
-# ---------------- speed: cache the heavy work so reruns/refreshes are instant ----------------
-@st.cache_data(show_spinner="Loading your saved data…")
-def _load_named_cached(stored):
-    return E.load_from_named_bytes(stored)
-
-@st.cache_data(show_spinner="Crunching the numbers…")
+# ---------------- speed: cache the heavy math; reuse across reruns ----------------
+@st.cache_data(show_spinner=False)
 def _compute(sales, inv, asof, A, pos, costs):
     sku = E.build_sku_table(sales, inv, asof)
     rec = E.recommend(sku, A, pos, costs, asof)
@@ -89,7 +76,6 @@ def _token_exp(tok, secret):
         return None
 
 def _cookie_mgr():
-    """An extra-streamlit-components CookieManager, or None if the component is unavailable."""
     try:
         import extra_streamlit_components as stx
         if "cookie_mgr" not in st.session_state:
@@ -119,7 +105,7 @@ def check_password() -> bool:
             exp = _token_exp(tok, correct)
             if exp and time.time() < exp:
                 st.session_state["auth_ok"] = True
-                if time.time() > exp - (IDLE_SECONDS - 60):   # slide idle window, throttled ~1/min
+                if time.time() > exp - (IDLE_SECONDS - 60):
                     try:
                         cm.set("toc_auth", _make_token(correct), key="auth_refresh",
                                expires_at=datetime.now() + timedelta(hours=12))
@@ -127,7 +113,7 @@ def check_password() -> bool:
                         pass
                 return True
         elif not st.session_state.get("auth_ok") and not st.session_state.get("_cookie_settled"):
-            st.session_state["_cookie_settled"] = True   # let the cookie component mount once
+            st.session_state["_cookie_settled"] = True
             st.info("Loading…"); st.stop()
 
     if st.session_state.get("auth_ok"):
@@ -152,38 +138,31 @@ def check_password() -> bool:
 if not check_password():
     st.stop()
 
-# ---------------- thin sidebar: log out only ----------------
-with st.sidebar:
-    st.markdown("### 📦 TOC Inventory")
-    st.caption("Order what actually sells.")
-    st.divider()
-    if st.button("Log out", use_container_width=True):
-        st.session_state["auth_ok"] = False
-        _cm = _cookie_mgr()
-        if _cm is not None:
-            try: _cm.delete("toc_auth", key="auth_logout")
-            except Exception: pass
-        st.rerun()
-
-# ---------------- load saved settings + persisted data ----------------
+# ---------------- settings + persisted small tables ----------------
 A = S.load_assumptions()
 costs = S.load_costs()
 pos = S.load_pos()
 
-def _handle_upload(ups):
-    """Save uploaded CSVs and (re)load the full set into session. Loader classifies
-    sales vs inventory by their columns, so it doesn't matter which tab you drop them on."""
-    S.save_uploaded_files(ups)
-    stored = S.load_stored_bytes()
-    st.session_state["data"] = (_load_named_cached(stored) if stored
-                                else E.load_from_uploads(ups))
+# ---------------- load canonical datasets into the session (cold start only) ----------------
+def _assemble_into_session(sales_df, inv_df):
+    inv_df = inv_df if (inv_df is not None and len(inv_df)) else pd.DataFrame(columns=E.INV_COLS)
+    st.session_state["data"] = E.assemble(sales_df, inv_df)
 
-# auto-load saved uploads so a refresh / cold start remembers your data
 if "data" not in st.session_state:
-    _stored = S.load_stored_bytes()
-    if _stored:
+    s = S.load_dataset("sales")
+    if s is not None and len(s):
+        _assemble_into_session(s, S.load_dataset("inventory"))
+    else:
+        # one-time migration: old raw-CSV blobs → canonical Parquet
         try:
-            st.session_state["data"] = _load_named_cached(_stored)
+            stored = S.load_stored_bytes()
+            if stored:
+                ls, li, _ = E.load_from_named_bytes(stored)
+                ls = ls[[c for c in E.SALES_COLS if c in ls.columns]]
+                li = li[[c for c in E.INV_COLS if c in li.columns]] if li is not None and len(li) else None
+                S.save_dataset("sales", ls)
+                if li is not None and len(li): S.save_dataset("inventory", li)
+                _assemble_into_session(ls, li)
         except Exception:
             pass
 
@@ -195,27 +174,111 @@ if HAS_DATA:
     has_inv = E.has_inventory(inv)
 
 def _short(d):
-    if d is None: return "—"
+    if d is None or pd.isna(d): return "—"
     t = pd.to_datetime(d); return f"{t.month}/{t.day}/{t.strftime('%y')}"
 
 def _need_data():
-    st.info("⬅️ No data loaded yet. Add your Shopify CSVs on the **Sales** and **Inventory** tabs.")
+    st.info("No data yet. Add your Shopify CSVs on the **Sales** and **Inventory** views (left).")
 
-# ---------------- tabs (Excel-style flow) ----------------
-T = st.tabs(["🏠 Start here", "🧾 Sales", "📦 Inventory", "🛒 Buy list",
-             "🔎 Audit a SKU", "🚚 Open POs", "💲 Costs"])
+# ---------------- shared upload widget (parses, date-stamps, merges, persists) ----------------
+def _ingest(prepared):
+    """prepared: list of {kind, df(full), date(None|str)}. Merge into canonical + persist."""
+    s_all = S.load_dataset("sales")
+    i_all = S.load_dataset("inventory")
+    n_sales = n_inv = 0
+    for p in prepared:
+        if p["kind"] == "sales":
+            nf = E.process_sales(p["df"], fallback_date=p["date"])
+            s_all = E.merge_sales(s_all, nf); n_sales += len(nf)
+        elif p["kind"] == "inventory":
+            nf = E.process_inventory(p["df"], p["date"])
+            i_all = E.merge_inventory(i_all, nf); n_inv += len(nf)
+    ok = True
+    if n_sales and s_all is not None: ok = S.save_dataset("sales", s_all) and ok
+    if n_inv and i_all is not None and len(i_all): ok = S.save_dataset("inventory", i_all) and ok
+    if s_all is not None and len(s_all):
+        _assemble_into_session(s_all, i_all)
+    _compute.clear()
+    return ok, n_sales, n_inv
+
+def _upload_widget(key):
+    ups = st.file_uploader("Add CSV(s) — sales and/or inventory", accept_multiple_files=True,
+                           type="csv", key=key)
+    if not ups:
+        return
+    prepared_meta = []
+    for f in ups:
+        try:
+            head = pd.read_csv(f, nrows=5); f.seek(0)
+        except Exception as ex:
+            st.warning(f"Couldn't read {f.name}: {ex}"); continue
+        kind = E.classify_columns(head.columns)
+        if kind is None:
+            st.warning(f"**{f.name}** — unrecognized columns (need a Shopify sales or inventory export).")
+            continue
+        status = E.file_date_status(head, f.name, kind)
+        if status == "per-row":
+            date = None  # sales already carries per-row dates
+            st.caption(f"📄 **{f.name}** → sales (dates read from the file)")
+        elif status is None:
+            picked = st.date_input(f"Snapshot date for **{f.name}**", value=_date.today(), key=f"date_{key}_{f.name}")
+            date = str(picked)
+            st.caption(f"📄 **{f.name}** → {kind} (you set the date)")
+        else:
+            date = status
+            st.caption(f"📄 **{f.name}** → {kind} (date {status})")
+        prepared_meta.append({"file": f, "kind": kind, "date": date})
+
+    st.write("")  # spacing so the dropzone never overlaps the button
+    if prepared_meta and st.button("⬇️ Load + save", type="primary", key=f"btn_{key}"):
+        try:
+            with st.spinner("Reading, date-stamping and saving…"):
+                prepared = []
+                for m in prepared_meta:
+                    df = pd.read_csv(m["file"]); m["file"].seek(0)
+                    prepared.append({"kind": m["kind"], "df": df, "date": m["date"]})
+                ok, ns, ni = _ingest(prepared)
+            if ok:
+                st.success(f"Loaded and saved {ns:,} sales + {ni:,} inventory rows.")
+            else:
+                st.warning(f"Loaded {ns:,} sales + {ni:,} inventory rows for this session, but "
+                           "saving to storage failed (connection or size). Try again or check Supabase.")
+            st.rerun()
+        except Exception as ex:
+            st.error(f"Import failed: {ex}")
+
+def _csv_download(label, df, filename, key):
+    st.download_button(label, df.to_csv(index=False).encode(), filename, "text/csv", key=key)
+
+# ---------------- sidebar: navigation (persists across reruns) ----------------
+VIEWS = ["🏠 Start here", "🧾 Sales", "📦 Inventory", "🛒 Buy list",
+         "🔎 Audit a SKU", "🚚 Open POs", "💲 Costs"]
+with st.sidebar:
+    st.markdown("### 📦 TOC Inventory")
+    nav = st.radio("Navigate", VIEWS, key="nav", label_visibility="collapsed")
+    st.divider()
+    if HAS_DATA:
+        st.caption(f"Window: {_short(health['sales_min'])} → {_short(health['sales_max'])}")
+    if st.button("Log out", use_container_width=True):
+        st.session_state["auth_ok"] = False
+        _cm = _cookie_mgr()
+        if _cm is not None:
+            try: _cm.delete("toc_auth", key="auth_logout")
+            except Exception: pass
+        st.rerun()
 
 # ================= Start here =================
-with T[0]:
+if nav == VIEWS[0]:
     st.title("📦 TOC Inventory")
     st.write("Your weekly buy list — what to reorder, in priority order, funded to your budget.")
 
     st.subheader("How to use it")
     st.markdown(
         "1. **Set your numbers** below.\n"
-        "2. **Add your data** on the **Sales** and **Inventory** tabs "
+        "2. **Add your data** on the **Sales** and **Inventory** views "
         "(Shopify *Total sales by product variant* + *Month-end inventory snapshot*).\n"
-        "3. Open the **Buy list** — it's sorted by priority and funded top-down to your budget.")
+        "3. Open the **Buy list** — sorted by priority, funded top-down to your budget. "
+        "Export anything to Excel from its view.")
 
     st.subheader("Your settings")
     s1, s2, s3 = st.columns(3)
@@ -227,13 +290,13 @@ with T[0]:
                                help="Cash cap for this cycle. The buy list funds top-down until it's spent.")
     s4, s5, _ = st.columns(3)
     A["default_cost"] = s4.number_input("Default unit cost ($)", 0.0, 1000.0, float(A["default_cost"]),
-                                        help="Used for any product without a real cost set (see Costs tab).")
+                                        help="Used for any product without a real cost set (see Costs).")
     A["pack"] = s5.number_input("Pack / MOQ", 1, 1000, int(A["pack"]),
                                 help="Order quantities round up to a multiple of this.")
-    if {k: A.get(k) for k in ("lead", "review", "otb", "default_cost", "pack")} != \
-       st.session_state.get("_last_assumptions"):
+    _keys = ("lead", "review", "otb", "default_cost", "pack")
+    if {k: A.get(k) for k in _keys} != st.session_state.get("_last_assumptions"):
         S.save_assumptions(A)
-        st.session_state["_last_assumptions"] = {k: A.get(k) for k in ("lead", "review", "otb", "default_cost", "pack")}
+        st.session_state["_last_assumptions"] = {k: A.get(k) for k in _keys}
 
     st.divider()
     st.subheader("Status")
@@ -251,49 +314,38 @@ with T[0]:
         m4.metric("This week's spend",
                   f"${cw.loc[cw['InBudget']=='BUY','OrderCost'].sum():,.0f} / ${A['otb']:,.0f}",
                   help=f"{int((cw['InBudget']=='BUY').sum())} colorways funded by your budget.")
-        _stored = S.list_stored_files()
-        if _stored:
-            st.caption(f"💾 {len(_stored)} file(s) saved — auto-loads when you reopen the app.")
-            if st.button("🗑️ Clear saved data"):
-                S.clear_stored_files(); st.session_state.pop("data", None)
-                st.success("Cleared."); st.rerun()
+        if st.button("🗑️ Clear saved data"):
+            S.clear_datasets(); st.session_state.pop("data", None)
+            _compute.clear(); st.success("Cleared."); st.rerun()
 
 # ================= Sales =================
-with T[1]:
+elif nav == VIEWS[1]:
     st.subheader("Sales")
-    st.caption("Drop your Shopify *Total sales by product variant* export here. "
-               "Re-uploading a file with the same name just overwrites it.")
-    ups = st.file_uploader("Add sales CSV(s)", accept_multiple_files=True, type="csv", key="up_sales")
-    if ups and st.button("Load + save", type="primary", key="btn_sales"):
-        try:
-            _handle_upload(ups); st.success("Loaded and saved."); st.rerun()
-        except Exception as ex:
-            st.error(str(ex))
+    st.caption("Upload your Shopify *Total sales by product variant* export. Each row keeps its "
+               "date; re-uploading merges (same day + SKU overwrites).")
+    _upload_widget("up_sales")
+    st.divider()
     if not HAS_DATA:
         _need_data()
     else:
         view = sales.copy()
         view["Day"] = pd.to_datetime(view["Day"]).dt.date
-        code_col = "Product variant SKU"
-        cols = ["Day", "Product", "Color", "Size"] + ([code_col] if code_col in view.columns else []) + ["units", "ns"]
-        view = view[cols].rename(columns={code_col: "SKU", "units": "Units sold", "ns": "Net sales"})
+        view = view[["Day", "Product", "Color", "Size", "Product variant SKU", "units", "ns"]].rename(
+            columns={"Product variant SKU": "SKU", "units": "Units sold", "ns": "Net sales"})
         pick = st.selectbox("Filter to a product", ["(all products)"] + sorted(sales["Product"].unique()), key="sales_pick")
         if pick != "(all products)":
             view = view[view["Product"] == pick]
         st.caption(f"{len(view):,} rows · {_short(health['sales_min'])} → {_short(health['sales_max'])}")
+        _csv_download("⬇️ Export sales (CSV)", view, "sales_export.csv", "dl_sales")
         st.dataframe(view.sort_values("Day", ascending=False), use_container_width=True, height=460, hide_index=True)
 
 # ================= Inventory =================
-with T[2]:
+elif nav == VIEWS[2]:
     st.subheader("Inventory")
-    st.caption("Drop your *Month-end inventory snapshot* export here. The on-hand drives "
-               "accurate order quantities and the in-stock-days pace.")
-    upi = st.file_uploader("Add inventory CSV(s)", accept_multiple_files=True, type="csv", key="up_inv")
-    if upi and st.button("Load + save", type="primary", key="btn_inv"):
-        try:
-            _handle_upload(upi); st.success("Loaded and saved."); st.rerun()
-        except Exception as ex:
-            st.error(str(ex))
+    st.caption("Upload your *Month-end inventory snapshot*. If the file has no date, you'll be "
+               "asked to set the snapshot date — it's stored with the data and shows in exports.")
+    _upload_widget("up_inv")
+    st.divider()
     if not HAS_DATA:
         _need_data()
     elif not has_inv:
@@ -302,16 +354,17 @@ with T[2]:
         iview = inv.copy()
         iview["date"] = pd.to_datetime(iview["date"]).dt.date
         iview = iview[["date", "Product", "Color", "Size", "oh", "cost"]].rename(
-            columns={"date": "Snapshot", "oh": "On hand", "cost": "Unit cost"})
+            columns={"date": "Snapshot date", "oh": "On hand", "cost": "Unit cost"})
         ipick = st.selectbox("Filter to a product", ["(all products)"] + sorted(inv["Product"].unique()), key="inv_pick")
         if ipick != "(all products)":
             iview = iview[iview["Product"] == ipick]
         st.caption(f"{len(iview):,} rows · snapshots {_short(health['inv_min'])} → {_short(health['inv_max'])}")
-        st.dataframe(iview.sort_values(["Snapshot", "Product"], ascending=[False, True]),
+        _csv_download("⬇️ Export inventory (CSV)", iview, "inventory_export.csv", "dl_inv")
+        st.dataframe(iview.sort_values(["Snapshot date", "Product"], ascending=[False, True]),
                      use_container_width=True, height=460, hide_index=True)
 
 # ================= Buy list =================
-with T[3]:
+elif nav == VIEWS[3]:
     st.subheader("Buy list")
     if not HAS_DATA:
         _need_data()
@@ -319,79 +372,77 @@ with T[3]:
         if not has_inv:
             st.warning("Quantities assume **0 on-hand** until you load inventory — treat this as a preview.")
         st.caption("Sorted by priority and funded top-down to your weekly budget. "
-                   "**Return/day** = pace × profit per unit. **BUY** = funded this cycle; **HOLD** = waits.")
+                   "**Return/day** = pace × profit per unit. **BUY** = funded; **HOLD** = waits.")
         gc1, gc2 = st.columns([2, 3])
-        grain = gc1.radio("View by", ["Colorway", "Size", "Product"], index=0, horizontal=True)
-        pick = gc2.selectbox("Filter to a product", ["(all products)"] + sorted(rec["Product"].unique()))
+        grain = gc1.radio("View by", ["Colorway", "Size", "Product"], index=0, horizontal=True, key="grain")
+        pick = gc2.selectbox("Filter to a product", ["(all products)"] + sorted(rec["Product"].unique()), key="buy_pick")
         rf = rec if pick == "(all products)" else rec[rec["Product"] == pick]
 
         if grain == "Product":
-            pr = E.product_rollup(rf, cw)
+            out = E.product_rollup(rf, cw)
             cols = ["Product", "Colorways", "Pace", "OnHand", "OnOrder", "ReorderPt", "Order",
                     "XS", "S", "M", "L", "XL", "Oth", "ProfitVelocity", "OrderCost"]
-            if "BuyColorways" in pr.columns: cols.insert(2, "BuyColorways")
-            st.dataframe(pr[cols].round({"Pace": 2, "ProfitVelocity": 1, "OrderCost": 0})
-                         .rename(columns={"ProfitVelocity": "Return/day"}),
-                         use_container_width=True, height=460, hide_index=True)
+            if "BuyColorways" in out.columns: cols.insert(2, "BuyColorways")
+            out = out[cols].round({"Pace": 2, "ProfitVelocity": 1, "OrderCost": 0}).rename(columns={"ProfitVelocity": "Return/day"})
             st.caption("Totals across every colorway of each product. BUY/HOLD is decided at the colorway level.")
         elif grain == "Colorway":
             cwf = cw if pick == "(all products)" else cw[cw["Product"] == pick]
-            show = cwf[["Product", "Color", "Pace", "OnHand", "OnOrder", "ReorderPt", "Order",
-                        "XS", "S", "M", "L", "XL", "Oth", "ProfitVelocity", "OrderCost", "CumCost", "InBudget"]].copy()
-            st.dataframe(show.round({"Pace": 2, "ProfitVelocity": 1, "OrderCost": 0, "CumCost": 0})
-                         .rename(columns={"ProfitVelocity": "Return/day", "InBudget": "Order?"}),
-                         use_container_width=True, height=460, hide_index=True)
+            out = cwf[["Product", "Color", "Pace", "OnHand", "OnOrder", "ReorderPt", "Order",
+                       "XS", "S", "M", "L", "XL", "Oth", "ProfitVelocity", "OrderCost", "CumCost", "InBudget"]]\
+                .round({"Pace": 2, "ProfitVelocity": 1, "OrderCost": 0, "CumCost": 0})\
+                .rename(columns={"ProfitVelocity": "Return/day", "InBudget": "Order?"})
         else:  # Size
             sz = rf.merge(cw[["Product", "Color", "InBudget"]], on=["Product", "Color"], how="left")
-            cols = ["SKU", "Product", "Color", "Size", "Pace", "DIS30", "OnHand", "OnOrder", "ReorderPt",
-                    "Order", "Zone", "InBudget", "UnitCost", "Price", "ProfitVelocity"]
-            st.dataframe(sz[cols].round({"Pace": 2, "ProfitVelocity": 1})
-                         .rename(columns={"ProfitVelocity": "Return/day", "InBudget": "Order?"})
-                         .sort_values("Order", ascending=False),
-                         use_container_width=True, height=460, hide_index=True)
+            out = sz[["SKU", "Product", "Color", "Size", "Pace", "DIS30", "OnHand", "OnOrder", "ReorderPt",
+                      "Order", "Zone", "InBudget", "UnitCost", "Price", "ProfitVelocity"]]\
+                .round({"Pace": 2, "ProfitVelocity": 1})\
+                .rename(columns={"ProfitVelocity": "Return/day", "InBudget": "Order?"})\
+                .sort_values("Order", ascending=False)
+
+        _csv_download("⬇️ Export this buy list (CSV)", out, f"buy_list_{grain.lower()}.csv", "dl_buy")
+        st.dataframe(out, use_container_width=True, height=460, hide_index=True)
 
         st.divider()
-        # ---- Factory PO downloads (this week's funded BUY rows) ----
-        buy_sizes = rec.merge(cw[cw["InBudget"] == "BUY"][["Product", "Color"]],
-                              on=["Product", "Color"], how="inner")
+        st.markdown("**Factory PO** — this week's funded BUY rows, in the shipping-list format")
+        buy_sizes = rec.merge(cw[cw["InBudget"] == "BUY"][["Product", "Color"]], on=["Product", "Color"], how="inner")
         buy_sizes = buy_sizes[buy_sizes["Order"] > 0]
         d1, d2 = st.columns(2)
         po_sku = buy_sizes.assign(Date=str(asof_d))[["Date", "SKU", "Product", "Color", "Size", "Order"]]\
             .rename(columns={"Order": "Qty"}).sort_values(["Product", "Color", "Size"])
-        d1.download_button("⬇️ Factory PO — by SKU (with codes)",
-                           po_sku.to_csv(index=False).encode(), "factory_po_by_sku.csv", "text/csv",
-                           help="One row per SKU with its real Shopify code — the order you hand the factory.")
+        with d1:
+            _csv_download("⬇️ Factory PO — by SKU (codes)", po_sku, "factory_po_by_sku.csv", "dl_po_sku")
         buy = cw[cw["InBudget"] == "BUY"]
         factory = buy.assign(Date=str(asof_d))[
             ["Date", "Product", "Color", "XS", "S", "M", "L", "XL", "Oth", "Order"]].rename(columns={"Order": "Total"})
-        d2.download_button("⬇️ Factory PO — by colorway (size grid)",
-                           factory.to_csv(index=False).encode(), "factory_po_by_colorway.csv", "text/csv",
-                           help="Size grid per colorway — matches the shipping-list format you send the manufacturer.")
+        with d2:
+            _csv_download("⬇️ Factory PO — by colorway (size grid)", factory, "factory_po_by_colorway.csv", "dl_po_cw")
 
 # ================= Audit a SKU =================
-with T[4]:
+elif nav == VIEWS[4]:
     st.subheader("Audit a SKU")
     if not HAS_DATA:
         _need_data()
     else:
-        st.caption("Pick a product, then a colorway, then a size — and see whether the pace ignores stockout days.")
+        st.caption("Pick a product, then a colorway, then a size. Pace divides units by days the SKU "
+                   "was actually in stock, so stockouts don't make a fast seller look slow.")
         a1, a2, a3 = st.columns(3)
-        prod = a1.selectbox("Product", sorted(rec["Product"].unique()))
+        prod = a1.selectbox("Product", sorted(rec["Product"].unique()), key="aud_prod")
         colors = sorted(rec[rec["Product"] == prod]["Color"].unique())
-        color = a2.selectbox("Colorway", colors)
+        color = a2.selectbox("Colorway", colors, key="aud_color")
         sizes = sorted(rec[(rec["Product"] == prod) & (rec["Color"] == color)]["Size"].unique())
-        size = a3.selectbox("Size", sizes)
+        size = a3.selectbox("Size", sizes, key="aud_size")
         row = rec[(rec["Product"] == prod) & (rec["Color"] == color) & (rec["Size"] == size)]
         if row.empty:
             st.info("No data for that combination.")
         else:
             r = row.iloc[0]
             st.caption(f"SKU code: **{r['SKU'] or '—'}**")
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Days in stock (30)", int(r["DIS30"]))
-            m2.metric("Units sold (30d)", int(r["U30"]))
-            m3.metric("Daily pace", f"{r['Pace']:.2f}")
-            m4.metric("Order now", int(r["Order"]))
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("On hand (units)", int(r["OnHand"]))
+            m2.metric("Days in stock (last 30d)", int(r["DIS30"]))
+            m3.metric("Units sold (30d)", int(r["U30"]))
+            m4.metric("Daily pace", f"{r['Pace']:.2f}")
+            m5.metric("Order now", int(r["Order"]))
             k = r["key"]
             start = asof - pd.Timedelta(days=41)
             ds = sales[(sales["key"] == k) & (sales["Day"] >= start)].groupby("Day")["units"].sum()
@@ -402,23 +453,19 @@ with T[4]:
             st.line_chart(chart)
 
 # ================= Open POs =================
-with T[5]:
+elif nav == VIEWS[5]:
     st.subheader("Open POs (what's on the way)")
     st.caption("Track inbound factory orders. The buy list nets a PO only if its ETA lands within "
                "lead + order cadence. Size must match the SKU's size so it nets correctly.")
     edit = pos[pos["status"].fillna("in_transit") == "in_transit"] if len(pos) else pos
-    # SKU pickers when we have data, so entries match the catalog and net correctly
     cfg = {"po_id": st.column_config.TextColumn("po_id", disabled=True)}
     if HAS_DATA:
-        # union catalog values with any values already on existing POs, so the
-        # dropdowns help without rejecting a row that was entered before.
         prod_opts = sorted(set(sku["Product"].unique()) | set(edit.get("product", pd.Series(dtype=str)).dropna().astype(str)))
         size_opts = sorted(set(sku["Size"].unique()) | set(edit.get("size", pd.Series(dtype=str)).dropna().astype(str)))
         cfg["product"] = st.column_config.SelectboxColumn("product", options=prod_opts)
         cfg["size"] = st.column_config.SelectboxColumn("size", options=size_opts)
     edited = st.data_editor(edit if len(edit) else pd.DataFrame(columns=S.PO_COLS),
-                            num_rows="dynamic", use_container_width=True, hide_index=True,
-                            column_config=cfg)
+                            num_rows="dynamic", use_container_width=True, hide_index=True, column_config=cfg)
     if st.button("💾 Save POs"):
         received = pos[pos["status"] == "received"] if len(pos) else pos
         S.save_pos(pd.concat([edited, received], ignore_index=True))
@@ -441,7 +488,7 @@ with T[5]:
                     S.mark_received(c['po_id']); st.success("Marked received."); st.rerun()
 
 # ================= Costs =================
-with T[6]:
+elif nav == VIEWS[6]:
     st.subheader("Costs")
     st.caption("Unit cost per product drives the profit ranking and inventory value. "
                "Products with no cost set use the default until you fill them in.")
@@ -450,20 +497,22 @@ with T[6]:
     else:
         new = E.detect_new_products(sku, costs)
         if new:
-            st.warning(f"⚠️ {len(new)} product(s) have **no cost set** and are using the "
+            st.warning(f"⚠️ {len(new)} product(s) have **no cost set** and use the "
                        f"${A['default_cost']:.0f} default: " + ", ".join(new[:8]) + (" …" if len(new) > 8 else ""))
         allp = sorted(sku["Product"].unique())
         cd = pd.DataFrame({"product": allp,
                            "unit_cost": [costs.get(p, A["default_cost"]) for p in allp],
                            "cost set?": ["—" if p in new else "✓" for p in allp]})
-        e = st.data_editor(cd, use_container_width=True, hide_index=True, height=440,
+        _csv_download("⬇️ Export costs (CSV)", cd, "unit_costs.csv", "dl_costs")
+        e = st.data_editor(cd, use_container_width=True, hide_index=True, height=420,
                            column_config={"product": st.column_config.TextColumn("product", disabled=True),
                                           "cost set?": st.column_config.TextColumn("cost set?", disabled=True)})
         if st.button("💾 Save costs"):
             S.save_costs({r["product"]: float(r["unit_cost"]) for _, r in e.iterrows() if r["unit_cost"]})
             st.success("Saved."); st.rerun()
 
-        with st.expander("🗂️ Inactive / dead stock — sold before, quiet now (no sales 90d, no stock)"):
+        st.divider()
+        with st.expander("Inactive / dead stock (no sales in 90 days, no stock)"):
             _ck = ("inactive", str(asof), len(sales))
             if st.session_state.get("_inactive_key") != _ck:
                 st.session_state["_inactive_df"] = E.inactive_skus(sales, inv, asof)
@@ -473,6 +522,7 @@ with T[6]:
                 st.success("No inactive SKUs — everything with history is either selling or in stock.")
             else:
                 st.caption(f"{len(inactive):,} dormant SKUs, most-recently-sold first.")
+                _csv_download("⬇️ Export inactive (CSV)", inactive, "inactive_skus.csv", "dl_inactive")
                 st.dataframe(inactive[["SKU", "Product", "Color", "Size", "LastSold", "DaysSince",
                                        "LifetimeUnits", "OnHand"]],
                              use_container_width=True, height=300, hide_index=True)

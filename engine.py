@@ -33,6 +33,9 @@ def load_sales_from_frames(frames: list[pd.DataFrame]) -> tuple[pd.DataFrame, pd
     """frames: list of sales DataFrames (the big multi-year file and/or single-day files).
     Single-day Shopify exports have no 'Day' column — caller must add it (see load_from_folder)."""
     df = pd.concat(frames, ignore_index=True)
+    if 'Day' not in df.columns:
+        raise ValueError("A sales file has no 'Day' date column and no date could be inferred "
+                         "from its name. Add a 'Day' column or pick a date at upload.")
     df = df.dropna(subset=['Day'])
     df['Day'] = pd.to_datetime(df['Day'])
     df = df.drop_duplicates(subset=['Day', 'Product variant SKU'], keep='last')
@@ -117,6 +120,87 @@ def load_from_named_bytes(named_bytes):
     Reuses the same column-based classifier as live uploads."""
     files = [_NamedBytes(data, name) for name, data in named_bytes]
     return load_from_uploads(files)
+
+# ---------------------------------------------------------------- canonical datasets
+# The app now keeps ONE processed sales table and ONE processed inventory table
+# (stored as Parquet). Each uploaded CSV is parsed + DATE-STAMPED once, then merged
+# in. This makes dates explicit/exportable, keeps cold loads fast (no re-parsing the
+# 49MB file every session), and dodges Supabase Storage's 50MB CSV upload cap.
+SALES_DATE_CANDIDATES = ['Day', 'Date', 'date']
+INV_DATE_CANDIDATES = ['Snapshot date', 'snapshot date', 'Snapshot Date', 'Date', 'date', 'Day']
+SALES_COLS = ['Day', 'Product', 'Color', 'Size', 'Product variant SKU', 'units', 'ns', 'key']
+INV_COLS = ['date', 'key', 'Product', 'Color', 'Size', 'oh', 'cost']
+
+def classify_columns(cols) -> str | None:
+    """'sales', 'inventory', or None — based on the tell-tale Shopify columns."""
+    cols = set(cols)
+    if 'Ending inventory units' in cols: return 'inventory'
+    if 'Net items sold' in cols: return 'sales'
+    return None
+
+def date_in_name(name):
+    ds = re.findall(r'(\d{4}-\d{2}-\d{2})', str(name))
+    return ds[-1] if ds else None
+
+def file_date_status(df_head: pd.DataFrame, name: str, kind: str):
+    """Given a small head of an upload, return the snapshot date string, the marker
+    'per-row' (sales already carries a Day column), or None if the user must pick one."""
+    cands = INV_DATE_CANDIDATES if kind == 'inventory' else SALES_DATE_CANDIDATES
+    for c in cands:
+        if c in df_head.columns and df_head[c].notna().any():
+            return 'per-row' if kind == 'sales' else str(pd.to_datetime(df_head[c].dropna().iloc[0]).date())
+    return date_in_name(name)
+
+def process_sales(df: pd.DataFrame, fallback_date=None) -> pd.DataFrame:
+    """Raw Shopify 'Total sales by product variant' -> engine-ready, date-stamped rows.
+    Needs a per-row date: a Day/Date column, else fallback_date applied to every row."""
+    df = df.copy()
+    daycol = next((c for c in SALES_DATE_CANDIDATES if c in df.columns), None)
+    if daycol:
+        df['Day'] = df[daycol]
+    elif fallback_date is not None:
+        df['Day'] = fallback_date
+    else:
+        raise ValueError("This sales file has no date column and no date was given — "
+                         "add a 'Day' column or pick a date at upload.")
+    df = df.dropna(subset=['Day'])
+    df['Day'] = pd.to_datetime(df['Day'])
+    df['units'] = pd.to_numeric(df.get('Net items sold'), errors='coerce').fillna(0)
+    df['ns'] = pd.to_numeric(df.get('Net sales'), errors='coerce').fillna(0)
+    pc = df['Product title'].map(split_product_color)
+    df['Product'] = [a for a, b in pc]; df['Color'] = [b for a, b in pc]
+    df['Size'] = df['Product variant title'].map(clean_size)
+    df['key'] = df['Product'] + ' | ' + df['Color'] + ' | ' + df['Size']
+    if 'Product variant SKU' not in df.columns: df['Product variant SKU'] = ''
+    return df[SALES_COLS]
+
+def process_inventory(df: pd.DataFrame, date) -> pd.DataFrame:
+    """Raw Shopify 'Month-end inventory snapshot' -> engine-ready rows stamped with `date`."""
+    if date is None:
+        raise ValueError("This inventory snapshot has no date — pick the snapshot date at upload.")
+    return _inv_frame(df, date)
+
+def merge_sales(old, new) -> pd.DataFrame:
+    both = pd.concat([x for x in (old, new) if x is not None and len(x)], ignore_index=True)
+    if both.empty: return both
+    both['Day'] = pd.to_datetime(both['Day'])
+    return both.drop_duplicates(subset=['Day', 'Product variant SKU'], keep='last')
+
+def merge_inventory(old, new) -> pd.DataFrame:
+    both = pd.concat([x for x in (old, new) if x is not None and len(x)], ignore_index=True)
+    if both.empty: return both
+    both['date'] = pd.to_datetime(both['date'])
+    return both.drop_duplicates(subset=['date', 'key'], keep='last')
+
+def assemble(sales: pd.DataFrame, inv: pd.DataFrame):
+    """Turn the canonical sales/inventory tables into the (sales, inv, asof) the app uses."""
+    sales = sales.copy()
+    sales['Day'] = pd.to_datetime(sales['Day'])
+    inv = inv.copy() if inv is not None else pd.DataFrame(columns=INV_COLS)
+    if not inv.empty:
+        inv['date'] = pd.to_datetime(inv['date'])
+    asof = sales['Day'].max()
+    return sales, inv, asof
 
 # ---------------------------------------------------------------- core build
 def build_sku_table(sales: pd.DataFrame, inv: pd.DataFrame, asof: pd.Timestamp) -> pd.DataFrame:
